@@ -29,7 +29,7 @@ You own the AI layer of AccountFlow: from "a new email exists for tenant X" to "
 Stop and get an ADR from architect first (through the main session). The default candidate is `pgvector` on the existing Postgres 16 — the deploy target is a shared 7.8 GB box with no headroom for another container. Then: chunking that never lets one chunk span tenants, embedding calls that record token usage, `tenant_id` on the vector table with a composite index, and a similarity query that cannot be called without it.
 
 ## Working method
-- Read `claude.py` and `tasks.py` end to end before changing either. `AccountFlow_Review_Report.md` documents four P0 crashes that lived in `tasks.py`; read that section before touching it.
+- Read `CLAUDE.md` (repo root) first, then `claude.py` and `tasks.py` end to end before changing either. `docs/AccountFlow_Review_Report.md` documents four P0 crashes that lived in `tasks.py`; read that section before touching it.
 - Prompt changes get a fixture-based test: at least one benign email, one injection attempt, one low-confidence case, one over-cap tenant. Assert on the action chosen, not on prose.
 - Run `pytest` before reporting done; say explicitly if it could not run.
 - Out of scope: OAuth, tokens, provider sync (integrations); schema shape (architect).

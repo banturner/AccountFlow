@@ -1,6 +1,8 @@
 # AccountFlow.ai — Technical Roadmap
 **12-Month Engineering Plan · July 2026 → June 2027**
 
+> **Verified against code on 2026-09-12.** This document describes intent; `STATUS.md` in this folder records what has actually shipped and is updated in the same commit as the change. The code snippets below are illustrations from planning time, not the current implementation — read the file before assuming a column or function exists.
+
 > **Engineering north star:** A multi-tenant, horizontally scalable AI email processing platform with <2-minute end-to-end latency, >99.5% uptime, and <1% unhandled error rate.
 
 ---
@@ -213,7 +215,7 @@ GET  /api/log?page=1&per_page=50
 - Replace single `DASHBOARD_API_KEY` with JWT tokens
 - `POST /auth/login` → returns `access_token` (15min) + `refresh_token` (30d)
 - Store refresh token in HttpOnly cookie
-- Add `python-jose[cryptography]==3.3.0` to requirements
+- ~~Add `python-jose[cryptography]==3.3.0` to requirements~~ — superseded: shipped as a stdlib HS256 implementation in `app/core/tokens.py` (python-jose is unmaintained with a CVE history; see the review report)
 
 ---
 

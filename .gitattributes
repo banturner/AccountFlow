@@ -1,0 +1,6 @@
+# Store LF in the repo and check out LF everywhere — the code deploys to a
+# Linux box and CRLF in a .sh, Dockerfile or .env silently breaks it.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.png binary

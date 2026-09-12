@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: accountflow
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: accountflow/requirements.txt
+      - run: pip install -r requirements.txt
+      - run: python -m compileall -q app alembic
+      - run: pytest -q
+
+  compose:
+    # The production pair must never carry the dev bind mount. Fails if
+    # ./:/app leaks into the rendered prod config (see docker-compose.prod.yml).
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: accountflow
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env
+      - name: dev config carries the live-reload mount
+        run: docker compose config | grep -q 'target: /app'
+      - name: prod config carries NO bind mount
+        run: |
+          if docker compose -f docker-compose.yml -f docker-compose.prod.yml config | grep -q 'target: /app'; then
+            echo "::error::dev bind mount leaked into the production compose config"
+            exit 1
+          fi
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

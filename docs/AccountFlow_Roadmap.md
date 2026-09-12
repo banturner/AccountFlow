@@ -1,6 +1,8 @@
 # AccountFlow.ai — Product Roadmap
 **12-Month Plan · July 2026 → June 2027**
 
+> **Verified against code on 2026-09-12.** Checkboxes here are planning intent; `STATUS.md` in this folder is the record of what has shipped. The `.docx` version in `business/` is generated from this file for investors — edit here, not there.
+
 > **North star:** The AI inbox assistant every Singapore SMB can afford and trust — automates 80% of customer email without any IT setup.
 
 ---

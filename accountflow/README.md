@@ -105,7 +105,28 @@ The link carries a Fernet-encrypted, single-draft, expiring token
 Approve/reject rules live in `app/services/draft_actions.py` and are shared
 with the JWT API, so the two paths cannot drift apart.
 
+## Dev vs production compose
+
+`docker compose up` (bare) auto-loads `docker-compose.override.yml`, which adds
+the live-reload bind mount. Production names its files explicitly —
+`-f docker-compose.yml -f docker-compose.prod.yml` — which skips the override,
+so the built image runs, not the host tree. Never copy the override file to a
+server. CI renders both configurations and fails if the mount leaks into prod.
+
+## Running tests
+
+```bash
+pip install -r requirements.txt
+pytest
+```
+
+`tests/conftest.py` seeds the required environment; nothing needs Postgres or
+network. `test_route_security.py` fails if a route ships without tenant/admin
+auth or accepts `tenant_id` from the client; `test_config_guard.py` proves
+production refuses `.env.example` placeholders. CI runs the same suite on every
+push (`.github/workflows/ci.yml`).
+
 ## Onboarding a customer
 
-See `ONBOARDING_RUNBOOK.md` (and `PDPA_Baseline_Pack.md` before any clinic
-goes live). Auto-send is **off by default** for every new tenant.
+See `ONBOARDING_RUNBOOK.md` (and `../docs/PDPA_Baseline_Pack.md` before any
+clinic goes live). Auto-send is **off by default** for every new tenant.

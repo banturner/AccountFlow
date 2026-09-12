@@ -1,0 +1,18 @@
+# Development overlay. Compose loads this file AUTOMATICALLY for a bare
+# `docker compose up` in this directory; it adds the live-reload bind mount so
+# edits on the host appear in the containers without a rebuild.
+#
+# It is NOT loaded when the compose files are named explicitly, which is how
+# production is started (see docker-compose.prod.yml). Never leave this file
+# on a server: with it present, a bare `docker compose up` there would mount
+# the host tree — .env included — over the built image.
+services:
+  api:
+    volumes:
+      - ./:/app
+  worker:
+    volumes:
+      - ./:/app
+  beat:
+    volumes:
+      - ./:/app

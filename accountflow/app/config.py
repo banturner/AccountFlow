@@ -1,5 +1,27 @@
 from functools import lru_cache
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Fragments that only ever appear in template values (.env.example, the setup
+# scripts' "fill me in later" markers, vendor docs). Matched case-insensitively.
+_PLACEHOLDER_FRAGMENTS = (
+    "changeme",
+    "your_",
+    "sk-ant-...",
+    "sg.xxx",
+    "xxx@sentry.io",
+    "not-set-yet",
+    "optional_not_configured",
+)
+
+# Secrets that must be present AND real before production will start.
+_REQUIRED_SECRETS = ("FERNET_KEY", "JWT_SECRET_KEY", "DASHBOARD_API_KEY", "ANTHROPIC_API_KEY")
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    lowered = (value or "").strip().lower()
+    return bool(lowered) and any(fragment in lowered for fragment in _PLACEHOLDER_FRAGMENTS)
 
 
 class Settings(BaseSettings):
@@ -66,6 +88,39 @@ class Settings(BaseSettings):
         "pro": 10000,       # legacy tier — kept for backwards compatibility
         "scale": 999999,
     }
+
+    @model_validator(mode="after")
+    def _refuse_placeholder_secrets_in_production(self):
+        """Fail at startup, not at the first customer email, if .env.example
+        values made it to a production box. Names only — never echo a value."""
+        if self.environment != "production":
+            return self
+
+        candidates = {
+            "DATABASE_URL": self.database_url,
+            "REDIS_URL": self.redis_url,
+            "FERNET_KEY": self.fernet_key,
+            "DASHBOARD_API_KEY": self.dashboard_api_key,
+            "JWT_SECRET_KEY": self.jwt_secret_key,
+            "ANTHROPIC_API_KEY": self.anthropic_api_key,
+            "GOOGLE_CLIENT_ID": self.google_client_id,
+            "GOOGLE_CLIENT_SECRET": self.google_client_secret,
+            "MICROSOFT_CLIENT_SECRET": self.microsoft_client_secret,
+            "SENDGRID_API_KEY": self.sendgrid_api_key,
+            "SENTRY_DSN": self.sentry_dsn,
+        }
+        bad = sorted(
+            name for name, value in candidates.items()
+            if _looks_like_placeholder(value)
+            or (name in _REQUIRED_SECRETS and not (value or "").strip())
+        )
+        if bad:
+            raise ValueError(
+                "Refusing to start with placeholder or blank secrets in production: "
+                + ", ".join(bad)
+                + ". Generate real values (see .env.example) or set ENVIRONMENT=development."
+            )
+        return self
 
 
 @lru_cache

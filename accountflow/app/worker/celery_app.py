@@ -1,9 +1,20 @@
+import sentry_sdk
 from celery import Celery
 from celery.schedules import crontab
 
 from app.config import get_settings
 
 settings = get_settings()
+
+# The worker is where most failures happen. Without its own init, the
+# capture_exception calls in tasks.py were silent no-ops outside the API process.
+if settings.sentry_dsn and settings.environment != "development":
+    sentry_sdk.init(
+        dsn=settings.sentry_dsn,
+        environment=settings.environment,
+        traces_sample_rate=0.1,
+        send_default_pii=False,
+    )
 
 celery_app = Celery(
     "accountflow",

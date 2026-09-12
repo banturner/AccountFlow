@@ -13,7 +13,7 @@ You review code for AccountFlow — an AI email-automation service that reads Si
 ## What to review against
 1. The diff, or the files named in the request. If `accountflow/` is not yet a git repository, review the named files in full.
 2. `docs/adr/` if present — code that contradicts an accepted ADR is a finding even when the code is correct.
-3. `AccountFlow_Review_Report.md` — anything marked fixed there is a regression if reintroduced. `PDPA_Baseline_Pack.md` — the data-handling promises made to customers.
+3. `CLAUDE.md` (repo root) — the invariants. `docs/AccountFlow_Review_Report.md` — anything marked fixed there is a regression if reintroduced. `docs/PDPA_Baseline_Pack.md` — the data-handling promises made to customers. `docs/STATUS.md` — must be updated in the same diff when a roadmap item changes state.
 
 ## Checklist — every item, every time
 Tenant isolation

@@ -101,8 +101,16 @@ have been up nine days healthy.
 
 ```bash
 ssh kvm2 'mkdir -p /opt/accountflow'
-scp -r ./accountflow/* kvm2:/opt/accountflow/
+scp -r ./accountflow/. kvm2:/opt/accountflow/
+ssh kvm2 'rm -f /opt/accountflow/docker-compose.override.yml'
 ```
+
+Two details that matter: `./accountflow/.` (not `*`) so the dotfiles —
+`.env.example`, `.dockerignore` — actually copy; and the override file is
+removed on arrival, because a bare `docker compose up` on the server would
+otherwise mount the host tree, `.env` included, over the built image. Once
+the GitHub remote exists, prefer `git clone` / `git pull` on the server over
+`scp` — the override removal still applies.
 
 ## 5. Configure
 
@@ -160,13 +168,17 @@ Then, in order:
 ## 8. Two things that will bite later
 
 **Backups.** The existing `backup` container knows nothing about
-`accountflow_postgres_data`. Until it does, pilot data is unprotected:
+`accountflow_postgres_data`. Until it does, pilot data is unprotected.
+`scripts/backup_db.sh` does a nightly `pg_dump` with 35-day retention (the
+PDPA pack's backup-ageing promise). Install it as part of the first deploy,
+not after:
 
 ```bash
-ssh kvm2 'docker exec accountflow-db pg_dump -U accountflow accountflow | gzip > /root/accountflow_$(date +%F).sql.gz'
+ssh kvm2 'install -m 750 /opt/accountflow/scripts/backup_db.sh /usr/local/bin/accountflow-backup && (crontab -l 2>/dev/null; echo "15 3 * * * /usr/local/bin/accountflow-backup >> /var/log/accountflow-backup.log 2>&1") | crontab - && /usr/local/bin/accountflow-backup'
 ```
 
-Put that on cron, and confirm it lands wherever the weekly GitHub backup goes.
+The last command runs one backup immediately so you see it work. Confirm the
+file also lands wherever the weekly GitHub backup goes.
 
 **The monitor bot.** Six unfamiliar containers plus a RAM step-change may set
 off KVM2 health alerts. Expect noise on the first day and tune thresholds

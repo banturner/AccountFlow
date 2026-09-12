@@ -29,6 +29,8 @@ if _settings.sentry_dsn and _settings.environment != "development":
         environment=_settings.environment,
         traces_sample_rate=0.2,
         profiles_sample_rate=0.1,
+        # PDPA: never attach request bodies, cookies or user identity to events.
+        send_default_pii=False,
     )
 
 app = FastAPI(

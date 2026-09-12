@@ -4,9 +4,13 @@
 #
 # Applied on top of docker-compose.yml. Four things it changes:
 #
-# 1. Drops the `./:/app` bind mount. In dev it live-reloads source; in
-#    production it overwrites the built image with whatever is on the host,
-#    including .env, which is exactly what .dockerignore exists to prevent.
+# 1. Runs WITHOUT the dev bind mount. The base file has no `./:/app` mount;
+#    docker-compose.override.yml adds one for development and is only
+#    auto-loaded by a bare `docker compose up`. Naming the files explicitly
+#    (as above) skips the override, so the built image — not the host tree
+#    with .env in it — is what runs. (An earlier version tried `volumes: []`
+#    here; Compose merges volume lists by target, so an empty list removes
+#    nothing. CI checks the rendered prod config for a leaked mount.)
 #
 # 2. Caps memory on every service. KVM2 has NO SWAP and shares RAM with
 #    Ollama, whose hermes3 model claims ~5 GB the moment it is invoked.
@@ -46,7 +50,6 @@ services:
     container_name: accountflow-api
     mem_limit: 640m
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
-    volumes: []          # drop the dev bind mount
 
   worker:
     container_name: accountflow-worker
@@ -56,13 +59,11 @@ services:
     command: >
       celery -A app.worker.celery_app worker
       --loglevel=info --concurrency=1 --max-tasks-per-child=200
-    volumes: []
 
   beat:
     container_name: accountflow-beat
     mem_limit: 256m
     command: celery -A app.worker.celery_app beat --loglevel=info
-    volumes: []
 
   nginx:
     container_name: accountflow-nginx

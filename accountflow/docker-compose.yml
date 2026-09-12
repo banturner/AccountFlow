@@ -1,3 +1,8 @@
+# Base stack. Safe to run as-is in production — there is deliberately NO
+# source bind mount here. Development gets its live-reload mount from
+# docker-compose.override.yml, which Compose loads automatically for a bare
+# `docker compose up`; production names its files explicitly
+# (`-f docker-compose.yml -f docker-compose.prod.yml`), which skips the override.
 version: "3.9"
 
 services:
@@ -42,10 +47,6 @@ services:
       # Bind to loopback only — external traffic must come through nginx
       # (rate limiting + TLS). "8000:8000" would expose the API directly.
       - "127.0.0.1:8000:8000"
-    volumes:
-      # Dev convenience: live-reload source. REMOVE in production so the
-      # image content (owned by appuser, no .env) is what actually runs.
-      - ./:/app
 
   worker:
     build: .
@@ -57,8 +58,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ./:/app
 
   beat:
     build: .
@@ -68,8 +67,6 @@ services:
     depends_on:
       - redis
       - worker
-    volumes:
-      - ./:/app
 
   nginx:
     image: nginx:alpine
