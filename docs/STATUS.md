@@ -87,7 +87,7 @@ Gaps, in order of risk: the worker path end to end (needs a Postgres service in 
 | Item | Status | Where |
 |---|---|---|
 | `/opt/accountflow` exists | OPEN — not deployed | `DEPLOY_KVM2.md` §4 |
-| Swap (box has none; Ollama's 4.7 GB model + AccountFlow = OOM) | OPEN | `DEPLOY_KVM2.md` §0 |
-| `OLLAMA_KEEP_ALIVE=60s` | OPEN | `DEPLOY_KVM2.md` §0 |
+| Swap (Ollama's 4.7 GB model + AccountFlow would OOM without it) | DONE 2026-09-12 | 4 GB `/swapfile`, in `/etc/fstab`; `swapon --show` confirms |
+| `OLLAMA_KEEP_ALIVE=60s` | DONE 2026-09-12 | systemd drop-in `/etc/systemd/system/ollama.service.d/keepalive.conf`; kitchen bots verified healthy after restart |
 | Domain + TLS | OPEN | `DEPLOY_KVM2.md` §1–3 |
 | Nightly `pg_dump` (the box's `backup` container ignores this volume) | OPEN — script ready | `accountflow/scripts/backup_db.sh` |
