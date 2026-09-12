@@ -16,7 +16,7 @@ Status words: DONE · PARTIAL · OPEN · VERIFY (believed true, not confirmed in
 | Celery Beat → APScheduler | OPEN | `beat` service still in `docker-compose.yml` |
 | Structured logging | DONE | `structlog` via `app/core/logging.py` |
 | Staging environment | OPEN | — |
-| CI running pytest before merge | PARTIAL | `.github/workflows/ci.yml` added 2026-09-12; needs the GitHub remote to exist |
+| CI running pytest before merge | DONE 2026-09-12 | `.github/workflows/ci.yml` on every push to `banturner/AccountFlow`; suite is 117 tests, passing locally under Python 3.12 (`pytest.ini` sets `pythonpath = .`). Branch protection requiring the check is not yet enabled |
 
 ## Phase 2 — Dashboard & self-serve (Sep–Oct 2026)
 
