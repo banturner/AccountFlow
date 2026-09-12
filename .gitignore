@@ -1,0 +1,29 @@
+# Secrets — never committed. .env.example is the template and IS tracked.
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Business documents live in Drive/Notion, not in git.
+business/
+*.docx
+*.pptx
+*.xlsx
+*.pdf
+*.zip
+.~lock.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Claude Code local permissions (per-machine)
+.claude/settings.local.json

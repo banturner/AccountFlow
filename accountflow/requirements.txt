@@ -1,0 +1,54 @@
+# Web framework
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+
+# Database
+sqlalchemy[asyncio]==2.0.31
+asyncpg==0.29.0
+alembic==1.13.2
+psycopg2-binary==2.9.9  # alembic env.py uses sync driver
+
+# Task queue
+celery[redis]==5.4.0
+redis==5.0.7
+
+# AI
+anthropic==0.30.0
+
+# Microsoft Graph (Outlook / M365 provider).
+# Graph calls go over httpx; msal is used only for the OAuth token dance.
+msal==1.31.0
+
+# Google APIs
+google-auth==2.32.0
+google-auth-oauthlib==1.2.1
+google-auth-httplib2==0.2.0
+google-api-python-client==2.139.0
+
+# Email
+sendgrid==6.11.0
+
+# Security / encryption
+cryptography==42.0.8
+bcrypt==4.1.3   # password hashing (used directly; JWT is stdlib HS256 in app/core/tokens.py)
+
+# Validation & settings
+pydantic==2.8.2
+pydantic-settings==2.3.4
+python-dotenv==1.0.1
+
+# Observability
+sentry-sdk[fastapi]==2.8.0
+structlog==24.4.0
+
+# HTTP client
+httpx==0.27.0
+
+# Utils
+python-multipart==0.0.9   # form data
+tenacity==8.4.1           # retry logic
+python-dateutil==2.9.0.post0  # used by worker to parse AI-proposed datetimes
+
+# Testing
+pytest==8.2.2
+pytest-asyncio==0.23.7
