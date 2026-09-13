@@ -1,6 +1,8 @@
 # AccountFlow — Roadmap status
 
-**Verified against code on 2026-09-12.** This table is the only place that says what has *shipped*; the roadmap documents describe intent. Update the relevant row in the same commit as the change.
+**Verified against code on 2026-09-13.** This table is the only place that says what has *shipped*; the roadmap documents describe intent. Update the relevant row in the same commit as the change.
+
+Whole-system architecture review: `architecture_review_2026-09-13.md` — verdict, ranked findings, tenant-isolation walk, and the recommended order of work before customer #1. Its RLS design is `adr/001-row-level-security.md` (proposed).
 
 Status words: DONE · PARTIAL · OPEN · VERIFY (believed true, not confirmed in code).
 
@@ -25,7 +27,7 @@ Status words: DONE · PARTIAL · OPEN · VERIFY (believed true, not confirmed in
 | JWT tenant auth, `tenant_id` from the verified token | DONE (early, Jul 2026) | `app/core/tokens.py`, `app/api/deps.py`; enforced by `tests/test_route_security.py` |
 | Edit draft body before approving | PARTIAL | Via the emailed review page (`api/routes/review.py`); no `PATCH /api/drafts/{id}` on the JWT API |
 | `/api/settings/profile`, `/plan`, `/automation` | DONE | `api/routes/settings.py` |
-| Pagination on list endpoints | OPEN | No `page` / `per_page` parameters in any route |
+| Pagination on list endpoints | DONE | `page` / `page_size` on `/api/drafts`, `/api/tasks`, `/api/emails` (`drafts.py:34`, `tasks.py:28`, `settings.py:118`). Wrongly listed OPEN on 2026-09-12 — corrected by the architecture review |
 | Weekly digest Monday 09:00 SGT | DONE | `worker/celery_app.py` `send-weekly-digest` |
 | Next.js dashboard | OPEN | — |
 | Customer self-onboarding | OPEN | OAuth connect exists (`/api/auth/{google,microsoft}/start`); no signup flow |
@@ -68,7 +70,7 @@ Status words: DONE · PARTIAL · OPEN · VERIFY (believed true, not confirmed in
 
 | Item | Status | Notes |
 |---|---|---|
-| Narrow Google scopes (`gmail.modify` + `calendar` → `gmail.readonly` + `gmail.send` + `calendar.events`) | OPEN — founder decision | Forces every connected Gmail to re-consent |
+| Narrow Google scopes | DONE (before 2026-09-12; wrongly listed OPEN) | `gmail.readonly` + `gmail.send` + `calendar.events` + `calendar.events.freebusy` in `services/gmail.py:40-45` and `api/routes/auth.py:46-51`. No live tenant was ever connected, so no re-consent cost. `gmail.readonly` is still a restricted scope (CASA) — see `OAUTH_DECISION_TESTS.md` |
 | Fernet key rotation via `MultiFernet` | OPEN | — |
 | Sentry `send_default_pii=False` explicit | DONE 2026-09-12 | `app/main.py`, `worker/celery_app.py` |
 | Auto-send keyword gate (prices / refunds / medical advice) | OPEN | — |
