@@ -127,18 +127,19 @@ def test_fresh_processing_thread_is_left_alone():
     assert stuck_thread_action(now - timedelta(minutes=5), now) is None
 
 
-def test_thread_inside_window_is_redispatched_once():
+def test_thread_just_under_fifteen_minutes_is_left_alone():
+    now = datetime.now(timezone.utc)
+    assert stuck_thread_action(now - timedelta(minutes=14, seconds=59), now) is None
+
+
+def test_thread_older_than_fifteen_minutes_is_redispatched_until_the_fail_line():
+    # Every sweep re-dispatches. Duplicates are harmless: process_single_email
+    # takes a row lock and re-checks the status, so a second dispatch finds
+    # the first run's terminal state and returns without classifying.
     now = datetime.now(timezone.utc)
     assert stuck_thread_action(now - timedelta(minutes=15), now) == "redispatch"
-    assert stuck_thread_action(now - timedelta(minutes=24, seconds=59), now) == "redispatch"
-
-
-def test_thread_past_window_but_under_an_hour_waits():
-    # Already re-dispatched once; a second dispatch while the first may still
-    # be running would classify and draft the same email twice.
-    now = datetime.now(timezone.utc)
-    assert stuck_thread_action(now - timedelta(minutes=25), now) is None
-    assert stuck_thread_action(now - timedelta(minutes=59), now) is None
+    assert stuck_thread_action(now - timedelta(minutes=25), now) == "redispatch"
+    assert stuck_thread_action(now - timedelta(minutes=59, seconds=59), now) == "redispatch"
 
 
 def test_thread_over_an_hour_is_failed_so_the_alert_can_see_it():

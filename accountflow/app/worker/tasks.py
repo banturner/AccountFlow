@@ -230,14 +230,22 @@ async def _process_tenant_inbox_async(integration_id: str):
     # Dispatch AFTER commit — otherwise the worker can pick a task up
     # before the thread row is visible and fail with "not found".
     for thread_id in to_dispatch:
-        process_single_email.delay(thread_id, integration_id)
+        try:
+            process_single_email.delay(thread_id, integration_id)
+        except Exception as e:
+            # Broker full (noeviction) or unreachable. The row is committed as
+            # `processing`, so the sweeper will re-dispatch it; keep going so
+            # one publish failure strands neither the rest of the batch nor
+            # the cap notice below.
+            log.error("dispatch_failed", thread_id=thread_id, error=str(e))
+            sentry_sdk.capture_exception(e)
 
     # Tell the owner ONCE, with the right message. Before this existed, the
     # only signal a capped tenant ever received was the staleness alert
     # claiming their inbox connection had died.
     if cap_notice:
         try:
-            await asyncio.to_thread(
+            message_id = await asyncio.to_thread(
                 send_email,
                 to_email=cap_notice["to_email"],
                 subject="AccountFlow: you've reached this month's email limit",
@@ -253,10 +261,15 @@ async def _process_tenant_inbox_async(integration_id: str):
                     f"— AccountFlow"
                 ),
             )
-            log.info("monthly_cap_email_sent", tenant_id=cap_notice["tenant_id"])
         except Exception as e:
-            log.error("monthly_cap_email_failed", tenant_id=cap_notice["tenant_id"], error=str(e))
+            message_id = None
             sentry_sdk.capture_exception(e)
+        # send_email swallows SendGrid errors and returns None, so the return
+        # value — not the absence of an exception — is the success signal.
+        if message_id:
+            log.info("monthly_cap_email_sent", tenant_id=cap_notice["tenant_id"])
+        else:
+            log.error("monthly_cap_email_failed", tenant_id=cap_notice["tenant_id"])
 
 
 @celery_app.task(
@@ -320,8 +333,15 @@ async def _process_single_email_async(thread_id: str, integration_id: str):
     notify: Optional[dict] = None
 
     async with AsyncSessionLocal() as db:
+        # Row lock, held until commit. A duplicate dispatch — the sweeper
+        # racing the original at --concurrency >= 2 — blocks here, then reads
+        # the terminal status the first run committed and returns below.
+        # Without the lock the status check is read-then-act and only holds
+        # because production happens to run a single worker slot.
         thread_result = await db.execute(
-            select(EmailThread).where(EmailThread.id == uuid.UUID(thread_id))
+            select(EmailThread)
+            .where(EmailThread.id == uuid.UUID(thread_id))
+            .with_for_update()
         )
         thread = thread_result.scalar_one_or_none()
 
@@ -340,12 +360,36 @@ async def _process_single_email_async(thread_id: str, integration_id: str):
             log.info("thread_already_handled", thread_id=thread_id, status=thread.status)
             return
 
+        if integration.tenant_id != thread.tenant_id:
+            # The pairing is correct by construction today; a stale or replayed
+            # queue message is the only way here. Never send from another
+            # tenant's mailbox or show their prompt this email.
+            thread.status = "failed"
+            thread.error_message = "Integration does not belong to this thread's tenant."
+            await db.commit()
+            log.error(
+                "thread_integration_tenant_mismatch",
+                thread_id=thread_id,
+                tenant_id=str(thread.tenant_id),
+                integration_id=integration_id,
+            )
+            return
+
         tenant_result = await db.execute(
             select(Tenant).where(Tenant.id == thread.tenant_id)
         )
         tenant = tenant_result.scalar_one_or_none()
         if not tenant:
             log.warning("tenant_missing", thread_id=thread_id)
+            return
+
+        if not tenant.is_active:
+            # Suspended or offboarded between ingest and processing: their
+            # customers' mail must not reach Claude.
+            thread.status = "failed"
+            thread.error_message = "Tenant inactive at processing time."
+            await db.commit()
+            log.info("thread_skipped_tenant_inactive", thread_id=thread_id, tenant_id=str(tenant.id))
             return
 
         # --- AI Classification ---
@@ -585,84 +629,136 @@ async def _sweep_stuck_threads_async():
     so the patient's email vanishes while the product reports itself healthy.
     This is the only path that turns that silent drop into a visible one.
     """
-    from sqlalchemy import select
-    from app.core.policy import STUCK_REDISPATCH_WINDOW, stuck_thread_action
+    from sqlalchemy import select, update
+    from app.core.policy import (
+        STUCK_REDISPATCH_AFTER,
+        STUCK_SWEEP_BATCH,
+        stuck_thread_action,
+    )
     from app.database import AsyncSessionLocal
     from app.models.email_thread import EmailThread
     from app.models.integration import Integration
+    from app.models.tenant import Tenant
 
     now = datetime.now(timezone.utc)
     to_redispatch: list[tuple[str, str]] = []
     failed = 0
 
     async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(EmailThread).where(
-                EmailThread.status == "processing",
-                EmailThread.created_at <= now - STUCK_REDISPATCH_WINDOW[0],
-            )
-        )
-        stuck = result.scalars().all()
-
-        for thread in stuck:
-            action = stuck_thread_action(thread.created_at, now)
-            if action == "fail":
-                thread.status = "failed"
-                thread.error_message = (
-                    "Stuck in processing for over an hour; no worker completed it."
+        # Columns only, bounded, oldest first: after an outage there may be
+        # thousands of these, each carrying a full patient email in body_text,
+        # and this runs inside the 768 MB worker next to the Claude call.
+        rows = (
+            await db.execute(
+                select(
+                    EmailThread.id,
+                    EmailThread.tenant_id,
+                    EmailThread.created_at,
+                    Tenant.is_active,
                 )
-                failed += 1
+                .join(Tenant, Tenant.id == EmailThread.tenant_id)
+                .where(
+                    EmailThread.status == "processing",
+                    EmailThread.created_at <= now - STUCK_REDISPATCH_AFTER,
+                )
+                .order_by(EmailThread.created_at)
+                .limit(STUCK_SWEEP_BATCH)
+            )
+        ).all()
+
+        async def _fail(thread_id, reason):
+            nonlocal failed
+            # Conditional on status so a thread that completed between the
+            # select and this update keeps its real outcome.
+            await db.execute(
+                update(EmailThread)
+                .where(EmailThread.id == thread_id, EmailThread.status == "processing")
+                .values(status="failed", error_message=reason)
+            )
+            failed += 1
+
+        # One integration lookup per tenant, not per thread.
+        mailbox_by_tenant: dict = {}
+
+        for thread_id, tenant_id, created_at, tenant_active in rows:
+            if not tenant_active:
+                await _fail(thread_id, "Tenant inactive; not processed.")
+                log.warning(
+                    "stuck_thread_failed_tenant_inactive",
+                    thread_id=str(thread_id),
+                    tenant_id=str(tenant_id),
+                )
+                continue
+
+            action = stuck_thread_action(created_at, now)
+            if action == "fail":
+                await _fail(
+                    thread_id,
+                    "Stuck in processing for over an hour; no worker completed it.",
+                )
                 log.warning(
                     "stuck_thread_failed",
-                    thread_id=str(thread.id),
-                    tenant_id=str(thread.tenant_id),
+                    thread_id=str(thread_id),
+                    tenant_id=str(tenant_id),
                 )
                 continue
             if action != "redispatch":
                 continue
 
             # Threads do not yet record which mailbox they came from
-            # (migration 009 adds integration_id). Until then, re-dispatch only
-            # when the tenant has exactly one active mailbox — the pilot
-            # reality — and otherwise fail loudly rather than guess.
-            integration_ids = (
-                await db.execute(
-                    select(Integration.id).where(
-                        Integration.tenant_id == thread.tenant_id,
-                        Integration.is_active == True,  # noqa: E712
+            # (migration 009 adds integration_id). Until then the only pairing
+            # that is not a guess is a tenant with a single integration row of
+            # ANY state, and that row active. Two rows — even one inactive —
+            # means the email may have come from the other one.
+            if tenant_id not in mailbox_by_tenant:
+                integrations = (
+                    await db.execute(
+                        select(Integration.id, Integration.is_active).where(
+                            Integration.tenant_id == tenant_id
+                        )
                     )
+                ).all()
+                mailbox_by_tenant[tenant_id] = (
+                    str(integrations[0][0])
+                    if len(integrations) == 1 and integrations[0][1]
+                    else None
                 )
-            ).scalars().all()
-            if len(integration_ids) == 1:
-                to_redispatch.append((str(thread.id), str(integration_ids[0])))
+            mailbox = mailbox_by_tenant[tenant_id]
+
+            if mailbox:
+                to_redispatch.append((str(thread_id), mailbox))
                 log.warning(
                     "stuck_thread_redispatched",
-                    thread_id=str(thread.id),
-                    tenant_id=str(thread.tenant_id),
+                    thread_id=str(thread_id),
+                    tenant_id=str(tenant_id),
                 )
             else:
-                thread.status = "failed"
-                thread.error_message = (
-                    f"Stuck in processing; cannot re-dispatch with "
-                    f"{len(integration_ids)} active mailboxes."
+                await _fail(
+                    thread_id,
+                    "Stuck in processing; cannot determine which mailbox it came from.",
                 )
-                failed += 1
                 log.warning(
                     "stuck_thread_failed_ambiguous_mailbox",
-                    thread_id=str(thread.id),
-                    tenant_id=str(thread.tenant_id),
-                    mailboxes=len(integration_ids),
+                    thread_id=str(thread_id),
+                    tenant_id=str(tenant_id),
                 )
 
         await db.commit()
 
     for thread_id, integration_id in to_redispatch:
-        process_single_email.delay(thread_id, integration_id)
+        try:
+            process_single_email.delay(thread_id, integration_id)
+        except Exception as e:
+            # Broker still full or down — exactly the condition this sweep
+            # exists to recover from. The thread stays `processing` and the
+            # next sweep tries again; one publish failure must not end the run.
+            log.error("stuck_thread_redispatch_failed", thread_id=thread_id, error=str(e))
+            sentry_sdk.capture_exception(e)
 
-    if stuck:
+    if rows:
         log.info(
             "stuck_thread_sweep",
-            found=len(stuck),
+            found=len(rows),
             redispatched=len(to_redispatch),
             failed=failed,
         )

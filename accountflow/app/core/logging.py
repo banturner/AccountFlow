@@ -10,6 +10,8 @@ import structlog
 
 from app.config import get_settings
 
+_HANDLER_NAME = "accountflow-structlog"
+
 
 def configure_logging() -> None:
     settings = get_settings()
@@ -42,10 +44,16 @@ def configure_logging() -> None:
         foreign_pre_chain=shared_processors,
     )
 
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(formatter)
-
     root_logger = logging.getLogger()
+    # Idempotent: the API calls this at import and Celery via the
+    # setup_logging signal. A second call must not add a second stdout
+    # handler, or every line prints twice.
+    if any(getattr(h, "name", None) == _HANDLER_NAME for h in root_logger.handlers):
+        return
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.set_name(_HANDLER_NAME)
+    handler.setFormatter(formatter)
     root_logger.addHandler(handler)
     root_logger.setLevel(logging.INFO)
 

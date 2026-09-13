@@ -46,9 +46,10 @@ celery_app.conf.update(
             "task": "app.worker.tasks.poll_all_tenants",
             "schedule": settings.gmail_poll_interval,  # seconds
         },
-        # Threads committed as `processing` whose task never completed. Every
-        # 10 minutes exactly: policy.STUCK_REDISPATCH_WINDOW is one interval
-        # wide so a thread is re-dispatched at most once.
+        # Threads committed as `processing` whose task never completed:
+        # re-dispatched after 15 min, failed after 60 (policy.py). Duplicate
+        # dispatches are harmless — process_single_email row-locks and
+        # re-checks status — so the interval is about latency, not safety.
         "sweep-stuck-threads": {
             "task": "app.worker.tasks.sweep_stuck_threads",
             "schedule": 600.0,

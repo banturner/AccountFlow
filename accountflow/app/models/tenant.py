@@ -42,7 +42,9 @@ class Tenant(Base):
     )
     # How many email threads processed this calendar month
     monthly_email_count: Mapped[int] = mapped_column(default=0)
-    # When to reset the monthly counter (1st of each month)
+    # When the counter was LAST reset. The poller compares this to now on the
+    # Singapore calendar month (policy.monthly_period_needs_reset); setting it
+    # to a future date would zero the counter on every poll.
     monthly_reset_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

@@ -15,13 +15,17 @@ DEFAULT_AUTO_SEND_THRESHOLD = 0.95
 SGT = ZoneInfo("Asia/Singapore")
 
 # A thread committed as `processing` whose task never completed. Younger than
-# the window: a Claude call may legitimately still be running. Inside the
-# window: its queue message was probably lost — re-dispatch once. The window
-# is exactly one sweep interval wide (the sweeper runs every 10 minutes), so a
-# thread cannot be re-dispatched twice and end up processed concurrently.
-# Past the fail line: give up and surface it through the error-rate alert.
-STUCK_REDISPATCH_WINDOW = (timedelta(minutes=15), timedelta(minutes=25))
+# STUCK_REDISPATCH_AFTER: a Claude call may legitimately still be running.
+# Older: its queue message was probably lost — re-dispatch on every sweep
+# until STUCK_FAIL_AFTER, then give up and surface it through the error-rate
+# alert. Re-dispatching more than once is harmless: process_single_email
+# takes a row lock and re-checks the status before doing anything, so a
+# duplicate finds the first run's terminal state and returns.
+STUCK_REDISPATCH_AFTER = timedelta(minutes=15)
 STUCK_FAIL_AFTER = timedelta(minutes=60)
+# Rows examined per sweep. After an outage there may be thousands, and the
+# worker runs under a 768 MB cap next to the Claude call.
+STUCK_SWEEP_BATCH = 500
 
 
 def should_auto_send(
@@ -103,7 +107,6 @@ def stuck_thread_action(created_at, now) -> Optional[str]:
     age = _aware(now) - _aware(created_at)
     if age >= STUCK_FAIL_AFTER:
         return "fail"
-    lower, upper = STUCK_REDISPATCH_WINDOW
-    if lower <= age < upper:
+    if age >= STUCK_REDISPATCH_AFTER:
         return "redispatch"
     return None
