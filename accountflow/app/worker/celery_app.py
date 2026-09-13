@@ -1,8 +1,10 @@
 import sentry_sdk
 from celery import Celery
 from celery.schedules import crontab
+from celery.signals import setup_logging
 
 from app.config import get_settings
+from app.core.logging import configure_logging
 
 settings = get_settings()
 
@@ -19,15 +21,17 @@ if settings.sentry_dsn and settings.environment != "development":
 celery_app = Celery(
     "accountflow",
     broker=settings.redis_url,
-    backend=settings.redis_url,
     include=["app.worker.tasks"],
 )
 
 celery_app.conf.update(
     # Serialisation
     task_serializer="json",
-    result_serializer="json",
     accept_content=["json"],
+    # No result backend. Nothing reads task results, and keeping 24h of them
+    # in the same Redis that is the broker competed with queued messages for
+    # its 96 MB — a lost queue message is a patient email nobody answers.
+    task_ignore_result=True,
     # Timezone
     timezone="Asia/Singapore",
     enable_utc=True,
@@ -35,13 +39,19 @@ celery_app.conf.update(
     task_acks_late=True,
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
-    # Results
-    result_expires=86400,  # 24h
-    # Beat schedule — Gmail poll every 120 seconds
+    broker_connection_retry_on_startup=True,
+    # Beat schedule — mailbox poll every 120 seconds
     beat_schedule={
         "poll-gmail-all-tenants": {
             "task": "app.worker.tasks.poll_all_tenants",
             "schedule": settings.gmail_poll_interval,  # seconds
+        },
+        # Threads committed as `processing` whose task never completed. Every
+        # 10 minutes exactly: policy.STUCK_REDISPATCH_WINDOW is one interval
+        # wide so a thread is re-dispatched at most once.
+        "sweep-stuck-threads": {
+            "task": "app.worker.tasks.sweep_stuck_threads",
+            "schedule": 600.0,
         },
         "reset-monthly-email-counts": {
             "task": "app.worker.tasks.reset_monthly_email_counts",
@@ -58,3 +68,11 @@ celery_app.conf.update(
         },
     },
 )
+
+
+@setup_logging.connect
+def _configure_worker_logging(**_kwargs):
+    # Celery installs its own root handlers at startup unless a receiver claims
+    # this signal. Until now the worker and beat never went through structlog,
+    # so production got plain-text lines instead of the JSON the API emits.
+    configure_logging()

@@ -283,8 +283,8 @@ async def send_reply(
         # Blocking Google API call — run in a thread so it never blocks the
         # shared event loop (critical in the FastAPI approve endpoint).
         sent = await asyncio.to_thread(_send)
-        log.info("email_sent", message_id=sent["id"], to=to_email)
+        log.info("email_sent", message_id=sent["id"])
         return sent["id"]
     except HttpError as e:
-        log.error("gmail_send_error", error=str(e), to=to_email)
+        log.error("gmail_send_error", error=str(e))
         return None

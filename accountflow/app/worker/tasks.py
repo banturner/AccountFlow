@@ -103,11 +103,13 @@ def process_tenant_inbox(self: Task, integration_id: str):
 async def _process_tenant_inbox_async(integration_id: str):
     from sqlalchemy import select
     from sqlalchemy.exc import IntegrityError
+    from app.core.policy import monthly_period_needs_reset
     from app.database import AsyncSessionLocal
     from app.models.integration import Integration
     from app.models.tenant import Tenant
     from app.models.email_thread import EmailThread
     from app.services.mail_provider import fetch_new_messages
+    from app.services.sendgrid import send_email
 
     async with AsyncSessionLocal() as db:
         result = await db.execute(
@@ -125,7 +127,26 @@ async def _process_tenant_inbox_async(integration_id: str):
         if not tenant or not tenant.is_active:
             return
 
-        # Enforce monthly email cap
+        now = datetime.now(timezone.utc)
+
+        # Lazy monthly reset: derive the period at poll time so a Beat outage
+        # on the 1st cannot leave a tenant capped for the rest of the month.
+        if tenant.monthly_reset_at is None:
+            tenant.monthly_reset_at = now
+        elif monthly_period_needs_reset(tenant.monthly_reset_at, now):
+            log.info(
+                "monthly_count_reset_lazy",
+                tenant_id=str(tenant.id),
+                previous=tenant.monthly_email_count,
+            )
+            tenant.monthly_email_count = 0
+            tenant.monthly_reset_at = now
+
+        # Stamped BEFORE the cap check and whether or not mail is found: a
+        # capped tenant is healthy, and without this stamp the staleness alert
+        # would tell them their inbox connection is broken.
+        integration.last_poll_at = now
+
         cap = settings.plan_caps.get(tenant.plan, 500)
         if tenant.monthly_email_count >= cap:
             log.warning(
@@ -135,12 +156,10 @@ async def _process_tenant_inbox_async(integration_id: str):
                 cap=cap,
                 count=tenant.monthly_email_count,
             )
+            await db.commit()
             return
 
         messages = await fetch_new_messages(db, integration)
-        # Stamped whether or not mail was found: the health check needs to know
-        # the poll ran at all, and fetch_new_messages records any error itself.
-        integration.last_poll_at = datetime.now(timezone.utc)
         log.info("fetched_messages", count=len(messages), tenant_id=str(tenant.id))
 
         to_dispatch = []
@@ -193,12 +212,51 @@ async def _process_tenant_inbox_async(integration_id: str):
             tenant.monthly_email_count += 1
             to_dispatch.append(str(thread.id))
 
+        # The cap was not reached when this poll began; if it is now, this
+        # cycle crossed it. Capture plain values before commit (see the
+        # MissingGreenlet note in _process_single_email_async).
+        cap_notice = None
+        if tenant.monthly_email_count >= cap:
+            cap_notice = {
+                "tenant_id": str(tenant.id),
+                "to_email": tenant.email,
+                "business_name": tenant.name,
+                "plan": tenant.plan,
+                "cap": cap,
+            }
+
         await db.commit()
 
     # Dispatch AFTER commit — otherwise the worker can pick a task up
     # before the thread row is visible and fail with "not found".
     for thread_id in to_dispatch:
         process_single_email.delay(thread_id, integration_id)
+
+    # Tell the owner ONCE, with the right message. Before this existed, the
+    # only signal a capped tenant ever received was the staleness alert
+    # claiming their inbox connection had died.
+    if cap_notice:
+        try:
+            await asyncio.to_thread(
+                send_email,
+                to_email=cap_notice["to_email"],
+                subject="AccountFlow: you've reached this month's email limit",
+                body=(
+                    f"Hi {cap_notice['business_name']},\n\n"
+                    f"AccountFlow has processed {cap_notice['cap']} emails for you this "
+                    f"month, which is the limit of your {cap_notice['plan'].title()} plan.\n\n"
+                    f"Your mailbox connection is fine and nothing has been lost — but new "
+                    f"customer emails will NOT be drafted or actioned until the 1st of next "
+                    f"month, so please handle the inbox manually until then.\n\n"
+                    f"To lift the limit now, reply to this email and we'll move you to a "
+                    f"larger plan.\n\n"
+                    f"— AccountFlow"
+                ),
+            )
+            log.info("monthly_cap_email_sent", tenant_id=cap_notice["tenant_id"])
+        except Exception as e:
+            log.error("monthly_cap_email_failed", tenant_id=cap_notice["tenant_id"], error=str(e))
+            sentry_sdk.capture_exception(e)
 
 
 @celery_app.task(
@@ -274,6 +332,12 @@ async def _process_single_email_async(thread_id: str, integration_id: str):
 
         if not thread or not integration:
             log.warning("thread_or_integration_missing", thread_id=thread_id)
+            return
+
+        if thread.status != "processing":
+            # Already handled — a sweeper re-dispatch raced the original task,
+            # or a retry arrived after the commit. Never classify twice.
+            log.info("thread_already_handled", thread_id=thread_id, status=thread.status)
             return
 
         tenant_result = await db.execute(
@@ -490,16 +554,118 @@ def reset_monthly_email_counts():
 
 
 async def _reset_monthly_counts_async():
+    """Scheduled reset. The poller also resets lazily (policy.
+    monthly_period_needs_reset), so a missed Beat run no longer strands a
+    capped tenant; this stays as the prompt path on the 1st."""
     from app.database import AsyncSessionLocal
     from app.models.tenant import Tenant
     from sqlalchemy import update
 
     async with AsyncSessionLocal() as db:
         await db.execute(
-            update(Tenant).values(monthly_email_count=0)
+            update(Tenant).values(
+                monthly_email_count=0,
+                monthly_reset_at=datetime.now(timezone.utc),
+            )
         )
         await db.commit()
     log.info("monthly_email_counts_reset")
+
+
+@celery_app.task(name="app.worker.tasks.sweep_stuck_threads")
+def sweep_stuck_threads():
+    """Every 10 minutes: re-dispatch or fail threads stuck in `processing`."""
+    return run_async(_sweep_stuck_threads_async())
+
+
+async def _sweep_stuck_threads_async():
+    """A thread is committed as `processing` before its task is queued. If the
+    queue message is lost — broker eviction, worker killed before ack — nothing
+    else ever touches the row, and the error-rate alert only counts `failed`,
+    so the patient's email vanishes while the product reports itself healthy.
+    This is the only path that turns that silent drop into a visible one.
+    """
+    from sqlalchemy import select
+    from app.core.policy import STUCK_REDISPATCH_WINDOW, stuck_thread_action
+    from app.database import AsyncSessionLocal
+    from app.models.email_thread import EmailThread
+    from app.models.integration import Integration
+
+    now = datetime.now(timezone.utc)
+    to_redispatch: list[tuple[str, str]] = []
+    failed = 0
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(EmailThread).where(
+                EmailThread.status == "processing",
+                EmailThread.created_at <= now - STUCK_REDISPATCH_WINDOW[0],
+            )
+        )
+        stuck = result.scalars().all()
+
+        for thread in stuck:
+            action = stuck_thread_action(thread.created_at, now)
+            if action == "fail":
+                thread.status = "failed"
+                thread.error_message = (
+                    "Stuck in processing for over an hour; no worker completed it."
+                )
+                failed += 1
+                log.warning(
+                    "stuck_thread_failed",
+                    thread_id=str(thread.id),
+                    tenant_id=str(thread.tenant_id),
+                )
+                continue
+            if action != "redispatch":
+                continue
+
+            # Threads do not yet record which mailbox they came from
+            # (migration 009 adds integration_id). Until then, re-dispatch only
+            # when the tenant has exactly one active mailbox — the pilot
+            # reality — and otherwise fail loudly rather than guess.
+            integration_ids = (
+                await db.execute(
+                    select(Integration.id).where(
+                        Integration.tenant_id == thread.tenant_id,
+                        Integration.is_active == True,  # noqa: E712
+                    )
+                )
+            ).scalars().all()
+            if len(integration_ids) == 1:
+                to_redispatch.append((str(thread.id), str(integration_ids[0])))
+                log.warning(
+                    "stuck_thread_redispatched",
+                    thread_id=str(thread.id),
+                    tenant_id=str(thread.tenant_id),
+                )
+            else:
+                thread.status = "failed"
+                thread.error_message = (
+                    f"Stuck in processing; cannot re-dispatch with "
+                    f"{len(integration_ids)} active mailboxes."
+                )
+                failed += 1
+                log.warning(
+                    "stuck_thread_failed_ambiguous_mailbox",
+                    thread_id=str(thread.id),
+                    tenant_id=str(thread.tenant_id),
+                    mailboxes=len(integration_ids),
+                )
+
+        await db.commit()
+
+    for thread_id, integration_id in to_redispatch:
+        process_single_email.delay(thread_id, integration_id)
+
+    if stuck:
+        log.info(
+            "stuck_thread_sweep",
+            found=len(stuck),
+            redispatched=len(to_redispatch),
+            failed=failed,
+        )
 
 
 @celery_app.task(name="app.worker.tasks.send_weekly_digest_all")

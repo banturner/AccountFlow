@@ -192,10 +192,11 @@ async def classify_and_draft(
 
     # Phase 3: escalate to Sonnet if confidence is low
     if result.get("confidence", 1.0) < 0.6:
+        # No subject here: clinic subjects are health-revealing and this line
+        # lands in stdout on a shared box. thread_id is logged by the caller.
         log.info(
             "escalating_to_sonnet",
             haiku_confidence=result.get("confidence"),
-            subject=subject[:80],
         )
         response = await asyncio.to_thread(_call_claude, SONNET_MODEL, system, user_message)
         result = response["result"]

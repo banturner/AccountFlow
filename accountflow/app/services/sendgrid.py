@@ -41,10 +41,10 @@ def send_email(
     try:
         response = _client.send(message)
         message_id = response.headers.get("X-Message-Id", "unknown")
-        log.info("sendgrid_sent", to=to_email, message_id=message_id, status=response.status_code)
+        log.info("sendgrid_sent", message_id=message_id, status=response.status_code)
         return message_id
     except Exception as e:
-        log.error("sendgrid_error", error=str(e), to=to_email)
+        log.error("sendgrid_error", error=str(e))
         return None
 
 

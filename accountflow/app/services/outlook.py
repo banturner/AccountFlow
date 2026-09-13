@@ -272,7 +272,6 @@ async def fetch_new_messages(
         log.error(
             "graph_api_error",
             status=e.response.status_code,
-            body=e.response.text[:300],
             integration_id=str(integration.id),
         )
         integration.last_poll_error = f"Graph error {e.response.status_code}"[:500]
@@ -304,7 +303,7 @@ async def send_reply(
     hand-build and nothing to sanitise.
     """
     if not reply_to_message_id:
-        log.error("microsoft_send_missing_message_id", to=to_email)
+        log.error("microsoft_send_missing_message_id")
         return None
 
     access_token = await get_access_token(db, integration)
@@ -320,7 +319,7 @@ async def send_reply(
             created.raise_for_status()
             draft_id = created.json().get("id")
             if not draft_id:
-                log.error("microsoft_createreply_no_id", to=to_email)
+                log.error("microsoft_createreply_no_id")
                 return None
 
             patched = await client.patch(
@@ -336,19 +335,17 @@ async def send_reply(
             )
             sent.raise_for_status()
 
-        log.info("email_sent_via_graph", message_id=draft_id, to=to_email)
+        log.info("email_sent_via_graph", message_id=draft_id)
         return draft_id
 
     except httpx.HTTPStatusError as e:
         log.error(
             "graph_send_error",
             status=e.response.status_code,
-            body=e.response.text[:300],
-            to=to_email,
         )
         return None
     except httpx.HTTPError as e:
-        log.error("graph_send_connection_error", error=str(e), to=to_email)
+        log.error("graph_send_connection_error", error=str(e))
         return None
 
 

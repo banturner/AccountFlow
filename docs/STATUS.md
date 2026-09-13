@@ -78,6 +78,21 @@ Status words: DONE · PARTIAL · OPEN · VERIFY (believed true, not confirmed in
 | Route-level tenant-scoping audit as a test | DONE 2026-09-12 | `tests/test_route_security.py` |
 | Secret scanning | PARTIAL | `gitleaks` in CI and `.pre-commit-config.yaml`; run `pre-commit install` locally |
 
+## Architecture review follow-ups (`architecture_review_2026-09-13.md` §5, in order)
+
+| # | Item | Status | Evidence |
+|---|---|---|---|
+| 1 | Redis `noeviction`; result backend dropped | DONE 2026-09-13 | `docker-compose.prod.yml` redis command; `worker/celery_app.py` `task_ignore_result=True`, no `backend=` |
+| 2 | Stuck-`processing` sweeper; `last_poll_at` stamped before the cap check; lazy monthly reset; real "plan limit reached" email | DONE 2026-09-13 | `worker/tasks.py` `sweep_stuck_threads` (every 10 min), `_process_tenant_inbox_async`; rules in `core/policy.py` (`stuck_thread_action`, `monthly_period_needs_reset`) with tests in `tests/test_policy.py`. Re-dispatch is limited to single-mailbox tenants until migration 009 records `integration_id` on threads |
+| 3 | Log hygiene: subject removed from the Claude escalation log, recipient addresses and Graph error bodies removed from provider/SendGrid logs, `configure_logging()` wired into the worker via the Celery `setup_logging` signal, docker log rotation (10 MB × 3) on every service | DONE 2026-09-13 | `services/claude.py`, `services/gmail.py`, `services/outlook.py`, `services/sendgrid.py`, `worker/celery_app.py`, `docker-compose.yml` `x-logging` |
+| 4 | Migration 009: `integration_id` on threads and drafts; `gmail_address` → `mailbox_address`; `sendgrid_message_id` → `sent_message_id`; `approve_and_send` uses the thread's mailbox | OPEN | Prerequisite for 7 |
+| 5 | Tenant id inside the review token; `SELECT … FOR UPDATE` in `approve_and_send`; auto-send retry guard | OPEN | `core/security.py`, `services/draft_actions.py`, `worker/tasks.py` |
+| 6 | Worker end-to-end test with Postgres in CI | OPEN | Prerequisite for 7 |
+| 7 | Row-level security per `adr/001-row-level-security.md` | OPEN — session started 2026-09-13 | Blocked on 4 and 6 |
+| 8 | Prod memory caps trimmed (api 384m, worker 512m), DB pool 5/5; then deploy: domain, TLS, backup cron | OPEN | `docker-compose.prod.yml`, `database.py`, `DEPLOY_KVM2.md` |
+| 9 | `OAUTH_DECISION_TESTS.md` A and B against the deployed instance | OPEN | Decides customer #1's provider |
+| 10 | PDPA pack §2 amended for the SendGrid review notification; DPO named; Anthropic + SendGrid DPAs | OPEN — founder | `docs/PDPA_Baseline_Pack.md` |
+
 ## Test coverage
 
 Present: JWT sign/verify/tamper, bcrypt policy, Fernet state and review tokens, policy rules, Gmail MIME parsing, Graph parsing + delta sync (410 reset, deltaLink persistence, error recording), route auth audit, config guard.
