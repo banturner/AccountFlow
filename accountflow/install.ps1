@@ -67,6 +67,7 @@ if (Test-Path ".env") {
     if ([string]::IsNullOrWhiteSpace($anthropicKey)) { $anthropicKey = "sk-ant-REPLACE-ME-LATER" }
 
     $dbPassword    = New-RandomSecret 24
+    $appDbPassword = New-RandomSecret 24
     $redisPassword = New-RandomSecret 24
     $adminKey      = New-RandomSecret 32
     $jwtSecret     = New-RandomSecret 48
@@ -77,7 +78,9 @@ if (Test-Path ".env") {
 POSTGRES_DB=accountflow
 POSTGRES_USER=accountflow
 POSTGRES_PASSWORD=$dbPassword
-DATABASE_URL=postgresql+asyncpg://accountflow:$dbPassword@db:5432/accountflow
+# The app connects as accountflow_app (row-level security); Alembic as the owner.
+DATABASE_URL=postgresql+asyncpg://accountflow_app:$appDbPassword@db:5432/accountflow
+MIGRATION_DATABASE_URL=postgresql+asyncpg://accountflow:$dbPassword@db:5432/accountflow
 
 REDIS_PASSWORD=$redisPassword
 REDIS_URL=redis://:$redisPassword@redis:6379/0

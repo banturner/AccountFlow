@@ -20,14 +20,16 @@ gen_b64url() { openssl rand -base64 32 | tr '+/' '-_' | tr -d '\n'; }
 # ── 2. First run: create .env with fresh secrets ───────────────────────
 if [ ! -f .env ]; then
   say "Creating your settings file (.env) with fresh secure secrets"
-  PG_PW="$(gen_hex)"; REDIS_PW="$(gen_hex)"; FERNET="$(gen_b64url)"
+  PG_PW="$(gen_hex)"; APP_PW="$(gen_hex)"; REDIS_PW="$(gen_hex)"; FERNET="$(gen_b64url)"
   ADMIN_KEY="$(gen_hex)"; JWT_KEY="$(gen_hex)$(gen_hex)"
   cat > .env <<ENVEOF
 # ── Database (auto-generated, do not change) ──────────────
 POSTGRES_DB=accountflow
 POSTGRES_USER=accountflow
 POSTGRES_PASSWORD=${PG_PW}
-DATABASE_URL=postgresql+asyncpg://accountflow:${PG_PW}@db:5432/accountflow
+# The app connects as accountflow_app (row-level security); Alembic as the owner.
+DATABASE_URL=postgresql+asyncpg://accountflow_app:${APP_PW}@db:5432/accountflow
+MIGRATION_DATABASE_URL=postgresql+asyncpg://accountflow:${PG_PW}@db:5432/accountflow
 
 # ── Redis (auto-generated, do not change) ─────────────────
 REDIS_PASSWORD=${REDIS_PW}

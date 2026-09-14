@@ -258,7 +258,7 @@ async def send_reply(
     clean_to = " ".join((to_email or "").splitlines()).strip()
 
     mime = MimeMessage()
-    mime["From"] = integration.gmail_address
+    mime["From"] = integration.mailbox_address
     mime["To"] = clean_to
     mime["Subject"] = clean_subject if clean_subject.lower().startswith("re:") else f"Re: {clean_subject}"
     if in_reply_to:

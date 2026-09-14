@@ -28,7 +28,7 @@ from sqlalchemy.orm import selectinload
 from app.config import get_settings
 from app.core.logging import get_logger
 from app.core.security import verify_review_token
-from app.database import get_db
+from app.database import bind_tenant, get_db
 from app.models.draft import Draft
 from app.services.draft_actions import DraftActionError, approve_and_send, reject
 
@@ -105,8 +105,8 @@ async def _load_draft(token: str, db: AsyncSession):
 
     Returns (draft, None) or (None, error_response).
     """
-    draft_id = verify_review_token(token, max_age_seconds=settings.review_link_days * 86400)
-    if not draft_id:
+    verified = verify_review_token(token, max_age_seconds=settings.review_link_days * 86400)
+    if not verified:
         return None, _message(
             "⏱️",
             "This link has expired",
@@ -114,15 +114,23 @@ async def _load_draft(token: str, db: AsyncSession):
             "notification email, or sign in to your dashboard to see pending replies.",
             status_code=400,
         )
+    tenant_str, draft_str = verified
     try:
-        parsed = uuid.UUID(draft_id)
+        tenant_id = uuid.UUID(tenant_str)
+        draft_id = uuid.UUID(draft_str)
     except ValueError:
         return None, _message(
             "⚠️", "Invalid link", "This review link could not be read.", status_code=400
         )
 
+    # The token is the only credential on this route, so it is also the only
+    # source of tenant context: bind it BEFORE the draft is read (ADR-001). The
+    # explicit tenant predicate stays — RLS is the backstop, not the filter.
+    await bind_tenant(db, tenant_id)
     result = await db.execute(
-        select(Draft).options(selectinload(Draft.thread)).where(Draft.id == parsed)
+        select(Draft)
+        .options(selectinload(Draft.thread))
+        .where(Draft.id == draft_id, Draft.tenant_id == tenant_id)
     )
     draft = result.scalar_one_or_none()
     if not draft:
@@ -177,7 +185,7 @@ async def review_page(token: str, db: AsyncSession = Depends(get_db)):
         "<button class='approve' type='submit' name='action' value='approve'>Approve &amp; send</button>"
         "<button class='reject' type='submit' name='action' value='reject'>Reject</button>"
         "</div></form>"
-        "<p class='note'>Approving sends this from your own Gmail, as a reply in "
+        "<p class='note'>Approving sends this from your own mailbox, as a reply in "
         "the original conversation.</p>"
     )
     return _page("Reply ready for your approval", inner)

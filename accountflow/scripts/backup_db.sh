@@ -9,9 +9,19 @@
 #   (crontab -l 2>/dev/null; echo '15 3 * * * /usr/local/bin/accountflow-backup >> /var/log/accountflow-backup.log 2>&1') | crontab -
 #   /usr/local/bin/accountflow-backup      # run once by hand and check the output
 #
-# Restore:
+# Restore into a fresh container — TWO steps, in this order. Roles are
+# cluster-level and this dump is taken with --no-owner, so it carries the
+# GRANTs and the row-level-security policies for the runtime role but not the
+# role itself. Create the role FIRST (ADR-001) or those grants fail to apply
+# and the restored app cannot connect at all. The password is the one inside
+# DATABASE_URL in /opt/accountflow/.env.
+#
+#   docker exec -i accountflow-db psql -U accountflow -d accountflow \
+#     -c "CREATE ROLE accountflow_app LOGIN PASSWORD '<password from DATABASE_URL>'"
 #   gunzip -c /root/backups/accountflow/accountflow_YYYY-MM-DD.sql.gz \
 #     | docker exec -i accountflow-db psql -U accountflow accountflow
+#
+# Then run `alembic upgrade head` (DEPLOY_KVM2.md §6) as a no-op sanity check.
 set -euo pipefail
 
 BACKUP_DIR="${BACKUP_DIR:-/root/backups/accountflow}"

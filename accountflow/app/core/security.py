@@ -66,22 +66,32 @@ def verify_state_token(token: str, max_age_seconds: int = 600) -> Optional[str]:
 # Emailed to the tenant owner so they can approve a draft without logging in.
 
 
-def create_review_token(draft_id: str) -> str:
+def create_review_token(tenant_id: str, draft_id: str) -> str:
     """Create an encrypted, expiring token authorising review of ONE draft.
 
     Bearer-style: possession of the link is the authorisation, so it must be
     unguessable (Fernet ciphertext), scoped to a single draft, and expiring.
+    The tenant id travels inside the token so the review route can bind the
+    row-level-security context (ADR-001) before it touches the drafts table:
+    the link is the only credential on that route, so it is also the only
+    legitimate source of tenant context there.
     """
-    return _fernet.encrypt((_REVIEW_PREFIX + draft_id).encode()).decode()
+    return _fernet.encrypt(f"{_REVIEW_PREFIX}{tenant_id}:{draft_id}".encode()).decode()
 
 
-def verify_review_token(token: str, max_age_seconds: int = 7 * 86400) -> Optional[str]:
-    """Verify a draft-review token. Returns the draft id, or None if the token
-    is invalid, expired, or is not a review token."""
+def verify_review_token(
+    token: str, max_age_seconds: int = 7 * 86400
+) -> Optional[tuple[str, str]]:
+    """Verify a draft-review token. Returns (tenant_id, draft_id), or None if
+    the token is invalid, expired, not a review token, or predates the tenant
+    id (no such link was ever sent to a live tenant)."""
     try:
         raw = _fernet.decrypt(token.encode(), ttl=max_age_seconds).decode()
     except (InvalidToken, ValueError):
         return None
     if not raw.startswith(_REVIEW_PREFIX):
         return None
-    return raw[len(_REVIEW_PREFIX):] or None
+    parts = raw[len(_REVIEW_PREFIX):].split(":")
+    if len(parts) != 2 or not all(parts):
+        return None
+    return parts[0], parts[1]

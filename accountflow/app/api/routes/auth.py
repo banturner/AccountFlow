@@ -27,7 +27,7 @@ from app.core.logging import get_logger
 from app.core.passwords import verify_password
 from app.core.security import create_state_token, encrypt_token, verify_state_token
 from app.core.tokens import create_token, decode_token
-from app.database import get_db
+from app.database import bind_tenant, get_db
 from app.models.integration import Integration
 from app.models.tenant import Tenant
 
@@ -185,6 +185,10 @@ async def google_oauth_callback(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid state parameter")
 
+    # The verified state token is the only tenant authority on this
+    # unauthenticated route, so it also binds the row-level-security context
+    # (ADR-001): the integrations upsert below runs under RLS.
+    await bind_tenant(db, tenant_id)
     tenant = await db.get(Tenant, tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
@@ -194,14 +198,14 @@ async def google_oauth_callback(
     await asyncio.to_thread(flow.fetch_token, code=code)
     creds: Credentials = flow.credentials
 
-    # Get the Gmail address
+    # Resolve which mailbox was connected
     from googleapiclient.discovery import build as google_build
 
     def _fetch_user_email() -> str:
         oauth2_service = google_build("oauth2", "v2", credentials=creds, cache_discovery=False)
         return oauth2_service.userinfo().get().execute().get("email")
 
-    gmail_address = await asyncio.to_thread(_fetch_user_email)
+    mailbox_address = await asyncio.to_thread(_fetch_user_email)
 
     # Upsert the integration
     result = await db.execute(
@@ -216,23 +220,23 @@ async def google_oauth_callback(
         existing.access_token_enc = encrypt_token(creds.token)
         existing.refresh_token_enc = encrypt_token(creds.refresh_token) if creds.refresh_token else existing.refresh_token_enc
         existing.token_expiry = creds.expiry
-        existing.gmail_address = gmail_address
+        existing.mailbox_address = mailbox_address
         existing.is_active = True
-        log.info("google_integration_updated", tenant_id=str(tenant_id), gmail=gmail_address)
+        log.info("google_integration_updated", tenant_id=str(tenant_id))
     else:
         integration = Integration(
             tenant_id=tenant_id,
             provider="google",
-            gmail_address=gmail_address,
+            mailbox_address=mailbox_address,
             access_token_enc=encrypt_token(creds.token),
             refresh_token_enc=encrypt_token(creds.refresh_token) if creds.refresh_token else None,
             token_expiry=creds.expiry,
         )
         db.add(integration)
-        log.info("google_integration_created", tenant_id=str(tenant_id), gmail=gmail_address)
+        log.info("google_integration_created", tenant_id=str(tenant_id))
 
     await db.commit()
-    return {"status": "connected", "gmail_address": gmail_address}
+    return {"status": "connected", "mailbox": mailbox_address}
 
 
 # ── Microsoft 365 / Outlook ───────────────────────────────────────────────
@@ -289,6 +293,8 @@ async def microsoft_oauth_callback(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid state parameter")
 
+    # As in the Google callback: the state token binds the RLS context.
+    await bind_tenant(db, tenant_id)
     tenant = await db.get(Tenant, tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
@@ -317,16 +323,16 @@ async def microsoft_oauth_callback(
         if token.get("refresh_token"):
             existing.refresh_token_enc = encrypt_token(token["refresh_token"])
         existing.token_expiry = expiry
-        existing.gmail_address = mailbox or existing.gmail_address
+        existing.mailbox_address = mailbox or existing.mailbox_address
         existing.is_active = True
         existing.last_poll_error = None
-        log.info("microsoft_integration_updated", tenant_id=str(tenant_id), mailbox=mailbox)
+        log.info("microsoft_integration_updated", tenant_id=str(tenant_id))
     else:
         db.add(
             Integration(
                 tenant_id=tenant_id,
                 provider="microsoft",
-                gmail_address=mailbox,
+                mailbox_address=mailbox,
                 access_token_enc=encrypt_token(token["access_token"]),
                 refresh_token_enc=(
                     encrypt_token(token["refresh_token"]) if token.get("refresh_token") else None
@@ -334,7 +340,7 @@ async def microsoft_oauth_callback(
                 token_expiry=expiry,
             )
         )
-        log.info("microsoft_integration_created", tenant_id=str(tenant_id), mailbox=mailbox)
+        log.info("microsoft_integration_created", tenant_id=str(tenant_id))
 
     await db.commit()
     return {"status": "connected", "mailbox": mailbox}

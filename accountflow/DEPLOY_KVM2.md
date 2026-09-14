@@ -133,6 +133,23 @@ Must be right or things fail quietly:
 | `GOOGLE_REDIRECT_URI` | `https://app.yourdomain.com/api/auth/google/callback`, character-for-character identical to the console |
 | `ENVIRONMENT` | `production` — disables `/api/docs` and forces secure cookies |
 | `POSTGRES_PASSWORD` / `REDIS_PASSWORD` | fresh, not the examples |
+| `DATABASE_URL` | the **runtime** DSN: `postgresql+asyncpg://accountflow_app:<app password>@db:5432/accountflow`. The API and worker connect as `accountflow_app`, a non-owner role that row-level security applies to (`docs/adr/001-row-level-security.md`). Pick a fresh password, different from `POSTGRES_PASSWORD` |
+| `MIGRATION_DATABASE_URL` | the **owner** DSN: `postgresql+asyncpg://accountflow:<POSTGRES_PASSWORD>@db:5432/accountflow`. Alembic only. If the two URLs name the same role, `alembic upgrade head` refuses to run — that configuration would silently disable RLS |
+
+**Rotating the app password later.** Migration `010` creates `accountflow_app`
+only on its first run. Once it is stamped, changing the password in
+`DATABASE_URL` alone leaves the role's real password untouched, and every API
+and worker connection then fails authentication — a total outage whose cause
+points nowhere near the role. Change the role first, from a shell on the box:
+
+```bash
+ssh kvm2
+cd /opt/accountflow
+docker compose -f docker-compose.yml -f docker-compose.prod.yml exec db psql -U accountflow -d accountflow
+```
+
+At the `psql` prompt run `ALTER ROLE accountflow_app PASSWORD '<new password>';`,
+then put the same value into `DATABASE_URL` and restart `api` and `worker`.
 | `SENDGRID_*` | working, or no owner ever gets a review email |
 
 Also set the server name in `nginx/nginx.conf` and the certificate paths to
@@ -147,6 +164,28 @@ ssh kvm2 'cd /opt/accountflow && docker compose -f docker-compose.yml -f docker-
 ```bash
 ssh kvm2 'cd /opt/accountflow && docker compose -f docker-compose.yml -f docker-compose.prod.yml exec api alembic upgrade head'
 ```
+
+The first `alembic upgrade head` also creates the `accountflow_app` role
+(migration `010`) from `DATABASE_URL`, so a fresh deploy needs no separate
+`CREATE ROLE` step. A **restore** does — see `scripts/backup_db.sh`.
+
+**Upgrading an instance that has already processed mail.** Every Celery task
+signature gained a leading `tenant_id` argument (ADR-001), so a message queued
+by the old code cannot run on the new worker: it raises `TypeError`, and the
+thread it belonged to sits in `processing` until the stuck-thread sweeper
+re-dispatches it. Nothing is lost, but the clean order is to drain the queue
+before swapping the image — stop `beat` so no new fan-outs are queued, give
+in-flight tasks a minute, then purge what is left:
+
+```bash
+ssh kvm2 'cd /opt/accountflow && docker compose -f docker-compose.yml -f docker-compose.prod.yml stop beat'
+```
+
+```bash
+ssh kvm2 'cd /opt/accountflow && docker compose -f docker-compose.yml -f docker-compose.prod.yml exec worker celery -A app.worker.celery_app purge -f'
+```
+
+A first deploy has an empty queue and skips this.
 
 ## 7. Verify
 

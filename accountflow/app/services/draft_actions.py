@@ -43,27 +43,28 @@ async def approve_and_send(
     draft: Draft,
     edited_body: Optional[str] = None,
 ) -> str:
-    """Send a pending draft via the tenant's own Gmail, then commit.
+    """Send a pending draft from the mailbox its thread arrived through, then commit.
 
     `draft.thread` must already be loaded (use selectinload) — lazy-loading a
     relationship inside an async session raises MissingGreenlet at runtime.
 
-    Returns the Gmail message id. Raises DraftActionError on any failure,
+    Returns the provider's message id. Raises DraftActionError on any failure,
     leaving the draft pending so it can be retried.
     """
     _require_pending(draft)
 
-    # Any active mail provider will do — the tenant may be on Gmail or on
-    # Microsoft 365, and this path must not care which.
+    # The mailbox is part of the draft's data (migration 009, ADR-002): reply
+    # from the integration the thread arrived through, never from "any active
+    # one" — a Graph-sourced draft must not reach the Gmail sender. The tenant
+    # predicate is belt-and-braces over row-level security.
     result = await db.execute(
-        select(Integration)
-        .where(
+        select(Integration).where(
+            Integration.id == draft.integration_id,
             Integration.tenant_id == draft.tenant_id,
             Integration.is_active == True,  # noqa: E712
         )
-        .order_by(Integration.updated_at.desc())
     )
-    integration = result.scalars().first()
+    integration = result.scalar_one_or_none()
     if not integration:
         raise DraftActionError(
             "This mailbox is no longer connected, so the reply could not be "
@@ -93,19 +94,19 @@ async def approve_and_send(
     )
     if not msg_id:
         raise DraftActionError(
-            "Gmail refused the message, so nothing was sent. Please try again "
-            "in a few minutes.",
+            "The mailbox provider refused the message, so nothing was sent. "
+            "Please try again in a few minutes.",
             status_code=502,
         )
 
     now = datetime.now(timezone.utc)
     draft.status = "sent"
-    draft.sendgrid_message_id = msg_id
+    draft.sent_message_id = msg_id
     draft.sent_at = now
     draft.reviewed_at = now
     await db.commit()
 
-    log.info("draft_approved", draft_id=str(draft.id), gmail_message_id=msg_id)
+    log.info("draft_approved", draft_id=str(draft.id), sent_message_id=msg_id)
     return msg_id
 
 

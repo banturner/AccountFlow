@@ -47,6 +47,7 @@ else
     ANTHROPIC_KEY=${ANTHROPIC_KEY:-sk-ant-REPLACE-ME-LATER}
 
     DB_PASSWORD=$(rand_secret)
+    APP_DB_PASSWORD=$(rand_secret)
     REDIS_PASSWORD=$(rand_secret)
     ADMIN_KEY=$(rand_secret)
     JWT_SECRET=$(rand_secret)
@@ -57,7 +58,9 @@ else
 POSTGRES_DB=accountflow
 POSTGRES_USER=accountflow
 POSTGRES_PASSWORD=${DB_PASSWORD}
-DATABASE_URL=postgresql+asyncpg://accountflow:${DB_PASSWORD}@db:5432/accountflow
+# The app connects as accountflow_app (row-level security); Alembic as the owner.
+DATABASE_URL=postgresql+asyncpg://accountflow_app:${APP_DB_PASSWORD}@db:5432/accountflow
+MIGRATION_DATABASE_URL=postgresql+asyncpg://accountflow:${DB_PASSWORD}@db:5432/accountflow
 
 REDIS_PASSWORD=${REDIS_PASSWORD}
 REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0

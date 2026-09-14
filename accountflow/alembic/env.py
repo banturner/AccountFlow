@@ -1,17 +1,23 @@
-import os
 from logging.config import fileConfig
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 # Import all models so Alembic sees their metadata
+from app.config import get_settings
 from app.database import Base
 import app.models  # noqa: F401
 
 config = context.config
 
-# Override sqlalchemy.url from environment (ignores placeholder in alembic.ini)
-db_url = os.environ.get("DATABASE_URL", "")
+# Migrations run as the table OWNER (the Postgres image's `accountflow` user);
+# the API and worker run as the non-owner `accountflow_app` role so that
+# row-level security applies to them (ADR-001, migration 010). Owner DSN from
+# MIGRATION_DATABASE_URL, falling back to DATABASE_URL only for a database that
+# predates the role split. Settings reads the environment first, then .env,
+# and alembic.ini's placeholder is ignored.
+settings = get_settings()
+db_url = settings.migration_database_url or settings.database_url
 # Alembic uses sync driver — swap asyncpg → psycopg2
 sync_url = db_url.replace("postgresql+asyncpg://", "postgresql://")
 config.set_main_option("sqlalchemy.url", sync_url)

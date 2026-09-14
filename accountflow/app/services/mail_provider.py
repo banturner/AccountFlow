@@ -200,7 +200,7 @@ async def check_availability(
 
     return await outlook.check_availability(
         access_token=creds,
-        mailbox=integration.gmail_address or "",
+        mailbox=integration.mailbox_address or "",
         start_datetime=start_datetime,
         end_datetime=end_datetime,
     )

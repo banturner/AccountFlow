@@ -1,5 +1,5 @@
 # ADR-001: Row-level security as the tenant-isolation backstop
-Status: proposed
+Status: accepted (implemented 2026-09-13, migrations `009` + `010`)
 Date: 2026-09-13
 Source: `docs/architecture_review_2026-09-13.md` §4 (architect subagent); prerequisites in §5, items 4–6.
 
@@ -44,3 +44,14 @@ Easier: a forgotten `WHERE` returns nothing instead of another clinic's mail; th
 5. `worker/tasks.py` — `tenant_id` as an explicit argument on all three tasks; invert the fan-out; wrap the digest and error-rate loops.
 6. Migration `010` — role, grants, `ENABLE`/`FORCE`, eight policies.
 7. `DEPLOY_KVM2.md` §5 and `scripts/backup_db.sh` — second DSN, `CREATE ROLE` in the restore path.
+
+### Refinements made during implementation (2026-09-13)
+- The policy expression is `tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid`. `current_setting(..., true)` returns NULL only while the variable has never been set on the connection; once a transaction-local value has expired it returns `''`, and `''::uuid` raises. The NULLIF keeps the unset case at zero rows on reused pooled connections — `tests/test_rls.py` exercises exactly that sequence. One `FOR ALL` policy per table, four in total ("eight" above counted USING and WITH CHECK separately).
+- Migration `010` creates the runtime role itself, taking name and password from `DATABASE_URL`, and refuses to run if `DATABASE_URL` and the migration connection use the same role or the runtime role is a superuser / `BYPASSRLS` — the two configurations that would make RLS a silent no-op. `downgrade()` drops the policies and disables RLS but leaves the role and its grants (harmless, and the app may be connected as it).
+- `after_begin` fires only when a transaction starts. A session whose transaction is already open when the tenant becomes known needs an explicit `bind_tenant(db, tenant_id)` (API) or `apply_tenant_context(db)` (the sweeps' per-tenant loops).
+- **The sweeps commit inside each tenant's scope and must leave no RLS-table row dirty across a scope boundary.** Two reasons, both found in review. With `autoflush=False`, a dirty row held past the `with` block is flushed at a later commit under whichever tenant's context is current, where its `USING` clause matches nothing and SQLAlchemy raises `StaleDataError`. And because all tenants share one session, a database error under one tenant aborts the transaction for every tenant after it; a single commit at the end of the loop would discard work already done and then raise. So each tenant commits its own work, and each tenant's `except` rolls back before the loop continues. Today the loops only dirty `tenants` rows, which are outside RLS — a property to preserve, not to rely on.
+- The unauthenticated OAuth callbacks (`api/routes/auth.py`) read and write `integrations`, so they bind the context from the verified state token — the same authority they already used for `tenant_id`.
+- `tenant_scope` and `bind_tenant` also bind `tenant_id` into structlog's contextvars, so every log line under a tenant context is attributable — `claude.py`'s included — without touching each call site.
+- The review token is `draft-review:<tenant_id>:<draft_id>`; single-id tokens are rejected (none were ever issued to a live tenant).
+- Cross-tenant work that iterates `tenants` and sets the context per tenant: `poll_all_tenants`, `sweep_stuck_threads` (added the same day by the pipeline-visibility work), the weekly digest and the hourly error-rate check.
+- Migration `009` is recorded as ADR-002 (mailbox ownership).

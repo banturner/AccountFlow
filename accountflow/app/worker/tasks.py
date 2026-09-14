@@ -1,8 +1,15 @@
 """
 Core Celery tasks — the Gmail → Claude → Action pipeline.
 
+Every task takes tenant_id as its FIRST argument and runs inside that
+tenant's row-level-security context (ADR-001). Nothing here derives the tenant
+from a row it has just read: the queue message carries it, and under RLS a
+stale or mispaired message resolves to zero rows rather than another clinic's
+mailbox. Cross-tenant sweeps read `tenants` (not under RLS) and then work per
+tenant with the context set, one tenant's failure never ending the sweep.
+
 Flow per tenant:
-  poll_all_tenants
+  poll_all_tenants                     (iterates tenants, sets the context)
     └── process_tenant_inbox (per active integration)
          └── for each new message:
               process_single_email
@@ -28,13 +35,23 @@ settings = get_settings()
 log = get_logger(__name__)
 
 
-def run_async(coro):
+def run_async(coro, tenant_id: Optional[str] = None):
     """Run an async coroutine from a sync Celery task.
 
     Each task gets a fresh event loop, so the shared async engine's pooled
     connections must be disposed before the loop closes — otherwise asyncpg
     connections leak across loops and raise 'attached to a different loop'.
+
+    `tenant_id` binds the row-level-security context (ADR-001) around the run.
+    asyncio copies the current context when it wraps the coroutine in a Task,
+    so entering the scope here means every transaction the task opens carries
+    `app.tenant_id`, and it is released when the task ends — the next task on
+    this worker starts unbound. Tasks that are genuinely cross-tenant
+    (poll_all_tenants and the sweeps) pass nothing and set the context per
+    tenant inside their own loops.
     """
+    from app.database import tenant_scope
+
     async def _wrapped():
         from app.database import engine
         try:
@@ -44,9 +61,25 @@ def run_async(coro):
 
     loop = asyncio.new_event_loop()
     try:
-        return loop.run_until_complete(_wrapped())
+        if tenant_id is None:
+            return loop.run_until_complete(_wrapped())
+        with tenant_scope(tenant_id):
+            return loop.run_until_complete(_wrapped())
     finally:
         loop.close()
+
+
+def _warn_if_unscoped(where: str) -> None:
+    """Shout if a tenant-scoped worker path runs with no tenant context.
+
+    Under row-level security an unset context makes every query return zero
+    rows, so the task finishes cleanly having done nothing — indistinguishable
+    from an empty inbox (ADR-001, "Consequences"). This makes it searchable.
+    """
+    from app.database import current_tenant_id
+
+    if current_tenant_id() is None:
+        log.error("tenant_context_missing", where=where)
 
 
 @celery_app.task(
@@ -58,30 +91,70 @@ def run_async(coro):
 def poll_all_tenants(self: Task):
     """
     Triggered every 120 seconds by Celery Beat.
-    Fetches all active integrations and fans out one task per integration.
+    Iterates active tenants and fans out one task per active integration.
     """
     return run_async(_poll_all_tenants_async())
 
 
 async def _poll_all_tenants_async():
+    """Tenant-first fan-out.
+
+    This used to select every integration in one cross-tenant query and send
+    the worker a bare integration_id, leaving the tenant to be re-derived from
+    the row at the other end. Now the loop is what knows the tenant: it reads
+    `tenants` (not under RLS), then lists each tenant's integrations with that
+    tenant's context set, so the ids in a queue message provably came from the
+    same scope.
+    """
     from sqlalchemy import select
-    from app.database import AsyncSessionLocal
+    from app.database import AsyncSessionLocal, apply_tenant_context, tenant_scope
     from app.models.integration import Integration
     from app.models.tenant import Tenant
 
+    fan_out: list[tuple[str, str]] = []
+
     async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(Integration)
-            .join(Tenant, Integration.tenant_id == Tenant.id)
-            .where(Integration.is_active == True)
-            .where(Tenant.is_active == True)
-        )
-        integrations = result.scalars().all()
+        tenant_ids = (
+            await db.execute(select(Tenant.id).where(Tenant.is_active == True))  # noqa: E712
+        ).scalars().all()
 
-    log.info("polling_tenants", count=len(integrations))
+        for tenant_id in tenant_ids:
+            try:
+                with tenant_scope(tenant_id):
+                    # The session's transaction is already open, so after_begin
+                    # will not fire again — write the context in explicitly.
+                    await apply_tenant_context(db)
+                    integration_ids = (
+                        await db.execute(
+                            select(Integration.id).where(
+                                Integration.tenant_id == tenant_id,
+                                Integration.is_active == True,  # noqa: E712
+                            )
+                        )
+                    ).scalars().all()
+            except Exception as e:
+                # One tenant's bad row must not stop every other clinic's mail
+                # from being polled for the rest of the cycle. The rollback is
+                # the part that makes that true for a DATABASE error: all
+                # tenants share one session, and an aborted transaction fails
+                # every subsequent statement on it until it is rolled back.
+                await db.rollback()
+                log.error("poll_tenant_failed", tenant_id=str(tenant_id), error=str(e))
+                sentry_sdk.capture_exception(e)
+                continue
+            fan_out.extend((str(tenant_id), str(i)) for i in integration_ids)
 
-    for integration in integrations:
-        process_tenant_inbox.delay(str(integration.id))
+    log.info("polling_tenants", tenants=len(tenant_ids), integrations=len(fan_out))
+
+    for tenant_id, integration_id in fan_out:
+        try:
+            process_tenant_inbox.delay(tenant_id, integration_id)
+        except Exception as e:
+            # Broker full (noeviction) or unreachable. Missing one poll cycle
+            # is recoverable — the next one re-reads the same mailbox — but a
+            # single publish failure must not strand the remaining tenants.
+            log.error("poll_dispatch_failed", integration_id=integration_id, error=str(e))
+            sentry_sdk.capture_exception(e)
 
 
 @celery_app.task(
@@ -90,17 +163,19 @@ async def _poll_all_tenants_async():
     max_retries=3,
     default_retry_delay=60,
 )
-def process_tenant_inbox(self: Task, integration_id: str):
+def process_tenant_inbox(self: Task, tenant_id: str, integration_id: str):
     """Process all new emails for a single tenant integration."""
     try:
-        return run_async(_process_tenant_inbox_async(integration_id))
+        return run_async(
+            _process_tenant_inbox_async(tenant_id, integration_id), tenant_id=tenant_id
+        )
     except Exception as exc:
         log.error("process_tenant_inbox_failed", integration_id=integration_id, error=str(exc))
         sentry_sdk.capture_exception(exc)
         raise self.retry(exc=exc)
 
 
-async def _process_tenant_inbox_async(integration_id: str):
+async def _process_tenant_inbox_async(tenant_id: str, integration_id: str):
     from sqlalchemy import select
     from sqlalchemy.exc import IntegrityError
     from app.core.policy import monthly_period_needs_reset
@@ -111,20 +186,30 @@ async def _process_tenant_inbox_async(integration_id: str):
     from app.services.mail_provider import fetch_new_messages
     from app.services.sendgrid import send_email
 
+    _warn_if_unscoped("process_tenant_inbox")
+
     async with AsyncSessionLocal() as db:
+        # `tenants` is deliberately outside RLS (login reads it before any
+        # context can exist), so this one is filtered by hand.
+        tenant_result = await db.execute(
+            select(Tenant).where(Tenant.id == uuid.UUID(tenant_id))
+        )
+        tenant = tenant_result.scalar_one_or_none()
+        if not tenant or not tenant.is_active:
+            return
+
+        # Under RLS this matches nothing unless the integration belongs to the
+        # tenant whose context is set, so a stale message pairing one tenant's
+        # id with another's mailbox reads as "not found" and stops here.
         result = await db.execute(
-            select(Integration).where(Integration.id == uuid.UUID(integration_id))
+            select(Integration).where(
+                Integration.id == uuid.UUID(integration_id),
+                Integration.tenant_id == tenant.id,
+            )
         )
         integration = result.scalar_one_or_none()
         if not integration:
             log.warning("integration_not_found", integration_id=integration_id)
-            return
-
-        tenant_result = await db.execute(
-            select(Tenant).where(Tenant.id == integration.tenant_id)
-        )
-        tenant = tenant_result.scalar_one_or_none()
-        if not tenant or not tenant.is_active:
             return
 
         now = datetime.now(timezone.utc)
@@ -163,7 +248,7 @@ async def _process_tenant_inbox_async(integration_id: str):
         log.info("fetched_messages", count=len(messages), tenant_id=str(tenant.id))
 
         to_dispatch = []
-        own_address = (integration.gmail_address or "").lower()
+        own_address = (integration.mailbox_address or "").lower()
 
         for msg in messages:
             # Never process mail sent by the connected mailbox itself —
@@ -190,6 +275,9 @@ async def _process_tenant_inbox_async(integration_id: str):
             # (tenant_id, gmail_message_id) is the race-proof backstop.
             thread = EmailThread(
                 tenant_id=tenant.id,
+                # The mailbox this arrived through, recorded now rather than
+                # guessed at send time (ADR-002).
+                integration_id=integration.id,
                 gmail_thread_id=msg["thread_id"],
                 gmail_message_id=msg["message_id"],
                 rfc_message_id=msg.get("rfc_message_id"),
@@ -231,7 +319,7 @@ async def _process_tenant_inbox_async(integration_id: str):
     # before the thread row is visible and fail with "not found".
     for thread_id in to_dispatch:
         try:
-            process_single_email.delay(thread_id, integration_id)
+            process_single_email.delay(tenant_id, thread_id, integration_id)
         except Exception as e:
             # Broker full (noeviction) or unreachable. The row is committed as
             # `processing`, so the sweeper will re-dispatch it; keep going so
@@ -278,29 +366,42 @@ async def _process_tenant_inbox_async(integration_id: str):
     max_retries=2,
     default_retry_delay=30,
 )
-def process_single_email(self: Task, thread_id: str, integration_id: str):
+def process_single_email(self: Task, tenant_id: str, thread_id: str, integration_id: str):
     """Run Claude classification + action for one email thread."""
     try:
-        return run_async(_process_single_email_async(thread_id, integration_id))
+        return run_async(
+            _process_single_email_async(tenant_id, thread_id, integration_id),
+            tenant_id=tenant_id,
+        )
     except Exception as exc:
         log.error("process_single_email_failed", thread_id=thread_id, error=str(exc))
         sentry_sdk.capture_exception(exc)
         if self.request.retries >= self.max_retries:
             # Out of retries — record the failure so the dashboard and the
             # hourly error-rate alert can see it, then surface the error.
-            run_async(_mark_thread_failed(thread_id, str(exc)))
+            run_async(
+                _mark_thread_failed(tenant_id, thread_id, str(exc)), tenant_id=tenant_id
+            )
             raise
         raise self.retry(exc=exc)
 
 
-async def _mark_thread_failed(thread_id: str, error: str):
+async def _mark_thread_failed(tenant_id: str, thread_id: str, error: str):
     from sqlalchemy import select
     from app.database import AsyncSessionLocal
     from app.models.email_thread import EmailThread
 
+    _warn_if_unscoped("mark_thread_failed")
+
     async with AsyncSessionLocal() as db:
+        # RLS would filter this too, but the explicit predicate is the
+        # invariant (CLAUDE.md 1) and this is a blind UPDATE by id: without it,
+        # a wrong id under a disabled backstop would fail another tenant's row.
         result = await db.execute(
-            select(EmailThread).where(EmailThread.id == uuid.UUID(thread_id))
+            select(EmailThread).where(
+                EmailThread.id == uuid.UUID(thread_id),
+                EmailThread.tenant_id == uuid.UUID(tenant_id),
+            )
         )
         thread = result.scalar_one_or_none()
         if thread:
@@ -309,7 +410,7 @@ async def _mark_thread_failed(thread_id: str, error: str):
             await db.commit()
 
 
-async def _process_single_email_async(thread_id: str, integration_id: str):
+async def _process_single_email_async(tenant_id: str, thread_id: str, integration_id: str):
     from sqlalchemy import select
     from app.database import AsyncSessionLocal
     from app.models.integration import Integration
@@ -332,21 +433,31 @@ async def _process_single_email_async(thread_id: str, integration_id: str):
     # AFTER commit so the review link can never point at an uncommitted row.
     notify: Optional[dict] = None
 
+    _warn_if_unscoped("process_single_email")
+
     async with AsyncSessionLocal() as db:
         # Row lock, held until commit. A duplicate dispatch — the sweeper
         # racing the original at --concurrency >= 2 — blocks here, then reads
         # the terminal status the first run committed and returns below.
         # Without the lock the status check is read-then-act and only holds
         # because production happens to run a single worker slot.
+        # Both predicates are explicit as well as RLS-enforced: the backstop
+        # is meant to back these up, not to replace them (CLAUDE.md 1, ADR-001).
         thread_result = await db.execute(
             select(EmailThread)
-            .where(EmailThread.id == uuid.UUID(thread_id))
+            .where(
+                EmailThread.id == uuid.UUID(thread_id),
+                EmailThread.tenant_id == uuid.UUID(tenant_id),
+            )
             .with_for_update()
         )
         thread = thread_result.scalar_one_or_none()
 
         integration_result = await db.execute(
-            select(Integration).where(Integration.id == uuid.UUID(integration_id))
+            select(Integration).where(
+                Integration.id == uuid.UUID(integration_id),
+                Integration.tenant_id == uuid.UUID(tenant_id),
+            )
         )
         integration = integration_result.scalar_one_or_none()
 
@@ -425,6 +536,9 @@ async def _process_single_email_async(thread_id: str, integration_id: str):
             draft = Draft(
                 tenant_id=tenant.id,
                 thread_id=thread.id,
+                # Fixed at draft time so approval cannot choose a different
+                # mailbox than the one the email arrived on (ADR-002).
+                integration_id=thread.integration_id,
                 to_email=thread.sender_email,
                 subject=f"Re: {thread.subject or ''}",
                 body=ai_result["draft_body"],
@@ -450,7 +564,7 @@ async def _process_single_email_async(thread_id: str, integration_id: str):
                     references=thread.rfc_references,
                 )
                 if msg_id:
-                    draft.sendgrid_message_id = msg_id
+                    draft.sent_message_id = msg_id
                     draft.sent_at = datetime.now(timezone.utc)
                 else:
                     draft.status = "pending_review"
@@ -470,7 +584,7 @@ async def _process_single_email_async(thread_id: str, integration_id: str):
                     "draft_body": ai_result["draft_body"],
                     "review_url": (
                         f"{settings.app_base_url.rstrip('/')}"
-                        f"/api/review/{create_review_token(str(draft.id))}"
+                        f"/api/review/{create_review_token(str(tenant.id), str(draft.id))}"
                     ),
                 }
 
@@ -635,36 +749,18 @@ async def _sweep_stuck_threads_async():
         STUCK_SWEEP_BATCH,
         stuck_thread_action,
     )
-    from app.database import AsyncSessionLocal
+    from app.database import AsyncSessionLocal, apply_tenant_context, tenant_scope
     from app.models.email_thread import EmailThread
-    from app.models.integration import Integration
     from app.models.tenant import Tenant
 
     now = datetime.now(timezone.utc)
-    to_redispatch: list[tuple[str, str]] = []
+    # (tenant_id, thread_id, integration_id) — the same triple the thread was
+    # created with, so a re-dispatch is indistinguishable from the original.
+    to_redispatch: list[tuple[str, str, str]] = []
     failed = 0
+    found = 0
 
     async with AsyncSessionLocal() as db:
-        # Columns only, bounded, oldest first: after an outage there may be
-        # thousands of these, each carrying a full patient email in body_text,
-        # and this runs inside the 768 MB worker next to the Claude call.
-        rows = (
-            await db.execute(
-                select(
-                    EmailThread.id,
-                    EmailThread.tenant_id,
-                    EmailThread.created_at,
-                    Tenant.is_active,
-                )
-                .join(Tenant, Tenant.id == EmailThread.tenant_id)
-                .where(
-                    EmailThread.status == "processing",
-                    EmailThread.created_at <= now - STUCK_REDISPATCH_AFTER,
-                )
-                .order_by(EmailThread.created_at)
-                .limit(STUCK_SWEEP_BATCH)
-            )
-        ).all()
 
         async def _fail(thread_id, reason):
             nonlocal failed
@@ -677,77 +773,97 @@ async def _sweep_stuck_threads_async():
             )
             failed += 1
 
-        # One integration lookup per tenant, not per thread.
-        mailbox_by_tenant: dict = {}
+        # Cross-tenant, so it reads `tenants` (not under RLS) and then works
+        # inside each tenant's context. A single unscoped query over
+        # email_threads would match zero rows under RLS and report a clean
+        # sweep having examined nothing — the exact silent success this task
+        # exists to prevent.
+        tenants = (await db.execute(select(Tenant.id, Tenant.is_active))).all()
 
-        for thread_id, tenant_id, created_at, tenant_active in rows:
-            if not tenant_active:
-                await _fail(thread_id, "Tenant inactive; not processed.")
-                log.warning(
-                    "stuck_thread_failed_tenant_inactive",
-                    thread_id=str(thread_id),
-                    tenant_id=str(tenant_id),
-                )
-                continue
+        for tenant_id, tenant_active in tenants:
+            try:
+                with tenant_scope(tenant_id):
+                    await apply_tenant_context(db)
 
-            action = stuck_thread_action(created_at, now)
-            if action == "fail":
-                await _fail(
-                    thread_id,
-                    "Stuck in processing for over an hour; no worker completed it.",
-                )
-                log.warning(
-                    "stuck_thread_failed",
-                    thread_id=str(thread_id),
-                    tenant_id=str(tenant_id),
-                )
-                continue
-            if action != "redispatch":
-                continue
-
-            # Threads do not yet record which mailbox they came from
-            # (migration 009 adds integration_id). Until then the only pairing
-            # that is not a guess is a tenant with a single integration row of
-            # ANY state, and that row active. Two rows — even one inactive —
-            # means the email may have come from the other one.
-            if tenant_id not in mailbox_by_tenant:
-                integrations = (
-                    await db.execute(
-                        select(Integration.id, Integration.is_active).where(
-                            Integration.tenant_id == tenant_id
+                    # Columns only, bounded, oldest first: after an outage
+                    # there may be thousands of these, each carrying a full
+                    # patient email in body_text, and this runs inside the
+                    # 768 MB worker next to the Claude call. Per tenant, so
+                    # one noisy tenant cannot crowd the others out of a sweep.
+                    rows = (
+                        await db.execute(
+                            select(
+                                EmailThread.id,
+                                EmailThread.created_at,
+                                EmailThread.integration_id,
+                            )
+                            .where(
+                                EmailThread.tenant_id == tenant_id,
+                                EmailThread.status == "processing",
+                                EmailThread.created_at <= now - STUCK_REDISPATCH_AFTER,
+                            )
+                            .order_by(EmailThread.created_at)
+                            .limit(STUCK_SWEEP_BATCH)
                         )
-                    )
-                ).all()
-                mailbox_by_tenant[tenant_id] = (
-                    str(integrations[0][0])
-                    if len(integrations) == 1 and integrations[0][1]
-                    else None
-                )
-            mailbox = mailbox_by_tenant[tenant_id]
+                    ).all()
+                    found += len(rows)
 
-            if mailbox:
-                to_redispatch.append((str(thread_id), mailbox))
-                log.warning(
-                    "stuck_thread_redispatched",
-                    thread_id=str(thread_id),
-                    tenant_id=str(tenant_id),
-                )
-            else:
-                await _fail(
-                    thread_id,
-                    "Stuck in processing; cannot determine which mailbox it came from.",
-                )
-                log.warning(
-                    "stuck_thread_failed_ambiguous_mailbox",
-                    thread_id=str(thread_id),
-                    tenant_id=str(tenant_id),
-                )
+                    for thread_id, created_at, integration_id in rows:
+                        if not tenant_active:
+                            await _fail(thread_id, "Tenant inactive; not processed.")
+                            log.warning(
+                                "stuck_thread_failed_tenant_inactive",
+                                thread_id=str(thread_id),
+                                tenant_id=str(tenant_id),
+                            )
+                            continue
 
-        await db.commit()
+                        action = stuck_thread_action(created_at, now)
+                        if action == "fail":
+                            await _fail(
+                                thread_id,
+                                "Stuck in processing for over an hour; no worker "
+                                "completed it.",
+                            )
+                            log.warning(
+                                "stuck_thread_failed",
+                                thread_id=str(thread_id),
+                                tenant_id=str(tenant_id),
+                            )
+                            continue
+                        if action != "redispatch":
+                            continue
 
-    for thread_id, integration_id in to_redispatch:
+                        # The mailbox is on the row (ADR-002): no guessing, and
+                        # a tenant with two mailboxes is no longer failed for it.
+                        to_redispatch.append(
+                            (str(tenant_id), str(thread_id), str(integration_id))
+                        )
+                        log.warning(
+                            "stuck_thread_redispatched",
+                            thread_id=str(thread_id),
+                            tenant_id=str(tenant_id),
+                        )
+
+                # Committed per tenant, while still inside its own scope. One
+                # shared commit at the end would mean a database error on the
+                # last tenant discarding every `failed` mark already made for
+                # the others AND raising before the re-dispatch loop runs —
+                # losing exactly the threads this task exists to rescue.
+                await db.commit()
+            except Exception as e:
+                # Whatever is wrong with this tenant, the others still have
+                # patient emails sitting in `processing`. Roll back first: the
+                # session is shared, and an aborted transaction poisons every
+                # statement after it.
+                await db.rollback()
+                log.error("stuck_sweep_tenant_failed", tenant_id=str(tenant_id), error=str(e))
+                sentry_sdk.capture_exception(e)
+                continue
+
+    for tenant_id, thread_id, integration_id in to_redispatch:
         try:
-            process_single_email.delay(thread_id, integration_id)
+            process_single_email.delay(tenant_id, thread_id, integration_id)
         except Exception as e:
             # Broker still full or down — exactly the condition this sweep
             # exists to recover from. The thread stays `processing` and the
@@ -755,10 +871,10 @@ async def _sweep_stuck_threads_async():
             log.error("stuck_thread_redispatch_failed", thread_id=thread_id, error=str(e))
             sentry_sdk.capture_exception(e)
 
-    if rows:
+    if found:
         log.info(
             "stuck_thread_sweep",
-            found=len(rows),
+            found=found,
             redispatched=len(to_redispatch),
             failed=failed,
         )
@@ -770,13 +886,52 @@ def send_weekly_digest_all():
     return run_async(_send_weekly_digest_async())
 
 
-async def _send_weekly_digest_async():
+async def _digest_counts(db, tenant_id, week_ago) -> dict:
+    """The four numbers in one tenant's digest. Every table read here is under
+    RLS, so the caller must already be inside that tenant's context."""
     from sqlalchemy import select, func
-    from app.database import AsyncSessionLocal
-    from app.models.tenant import Tenant
     from app.models.email_thread import EmailThread
     from app.models.draft import Draft
     from app.models.task import Task
+
+    emails = await db.execute(
+        select(func.count(EmailThread.id)).where(
+            EmailThread.tenant_id == tenant_id,
+            EmailThread.created_at >= week_ago,
+        )
+    )
+    drafts_sent = await db.execute(
+        select(func.count(Draft.id)).where(
+            Draft.tenant_id == tenant_id,
+            Draft.status.in_(["sent", "auto_sent"]),
+            Draft.created_at >= week_ago,
+        )
+    )
+    tasks_created = await db.execute(
+        select(func.count(Task.id)).where(
+            Task.tenant_id == tenant_id,
+            Task.created_at >= week_ago,
+        )
+    )
+    appointments = await db.execute(
+        select(func.count(Task.id)).where(
+            Task.tenant_id == tenant_id,
+            Task.google_event_id.is_not(None),
+            Task.created_at >= week_ago,
+        )
+    )
+    return {
+        "emails_processed": emails.scalar() or 0,
+        "drafts_sent": drafts_sent.scalar() or 0,
+        "tasks_created": tasks_created.scalar() or 0,
+        "appointments_booked": appointments.scalar() or 0,
+    }
+
+
+async def _send_weekly_digest_async():
+    from sqlalchemy import select
+    from app.database import AsyncSessionLocal, apply_tenant_context, tenant_scope
+    from app.models.tenant import Tenant
     from app.services.sendgrid import send_weekly_digest
 
     week_ago = datetime.now(timezone.utc) - timedelta(days=7)
@@ -788,43 +943,29 @@ async def _send_weekly_digest_async():
         tenants = tenants_result.scalars().all()
 
         for tenant in tenants:
-            emails = await db.execute(
-                select(func.count(EmailThread.id)).where(
-                    EmailThread.tenant_id == tenant.id,
-                    EmailThread.created_at >= week_ago,
-                )
-            )
-            drafts_sent = await db.execute(
-                select(func.count(Draft.id)).where(
-                    Draft.tenant_id == tenant.id,
-                    Draft.status.in_(["sent", "auto_sent"]),
-                    Draft.created_at >= week_ago,
-                )
-            )
-            tasks_created = await db.execute(
-                select(func.count(Task.id)).where(
-                    Task.tenant_id == tenant.id,
-                    Task.created_at >= week_ago,
-                )
-            )
+            try:
+                # Cross-tenant sweep: every count is on an RLS-protected table,
+                # so each iteration sets its own context. Unscoped, the digest
+                # would cheerfully report zeros to every customer.
+                with tenant_scope(tenant.id):
+                    await apply_tenant_context(db)
+                    counts = await _digest_counts(db, tenant.id, week_ago)
 
-            appointments = await db.execute(
-                select(func.count(Task.id)).where(
-                    Task.tenant_id == tenant.id,
-                    Task.google_event_id.is_not(None),
-                    Task.created_at >= week_ago,
+                await asyncio.to_thread(
+                    send_weekly_digest,
+                    to_email=tenant.email,
+                    business_name=tenant.name,
+                    **counts,
                 )
-            )
-
-            await asyncio.to_thread(
-                send_weekly_digest,
-                to_email=tenant.email,
-                business_name=tenant.name,
-                emails_processed=emails.scalar() or 0,
-                drafts_sent=drafts_sent.scalar() or 0,
-                tasks_created=tasks_created.scalar() or 0,
-                appointments_booked=appointments.scalar() or 0,
-            )
+            except Exception as e:
+                # One tenant's failure must not cost every later tenant their
+                # digest — the loop is ordered, so they would all be lost. The
+                # rollback matters even though this loop only reads: a failed
+                # statement aborts the shared transaction, and without it every
+                # remaining tenant would fail too.
+                await db.rollback()
+                log.error("weekly_digest_failed", tenant_id=str(tenant.id), error=str(e))
+                sentry_sdk.capture_exception(e)
 
 
 @celery_app.task(name="app.worker.tasks.check_tenant_error_rates")
@@ -849,12 +990,9 @@ async def _check_tenant_error_rates_async():
          first thing anyone noticed was a customer asking why the AI had
          stopped replying.
     """
-    from sqlalchemy import func, select
+    from sqlalchemy import select
 
-    from app.core.policy import poll_is_stale
     from app.database import AsyncSessionLocal
-    from app.models.email_thread import EmailThread
-    from app.models.integration import Integration
     from app.models.tenant import Tenant
     from app.services.sendgrid import send_email
 
@@ -870,84 +1008,109 @@ async def _check_tenant_error_rates_async():
             if tenant.last_error_alert_at and tenant.last_error_alert_at > day_ago:
                 continue
 
-            subject = None
-            body = None
+            try:
+                subject, body = await _tenant_health_alert(db, tenant, now, day_ago)
+                if subject is None:
+                    continue
 
-            # ── Mode 2: is the mailbox connection itself broken? ──────────
-            integrations = (
-                (
-                    await db.execute(
-                        select(Integration).where(
-                            Integration.tenant_id == tenant.id,
-                            Integration.is_active == True,  # noqa: E712
-                        )
+                await asyncio.to_thread(
+                    send_email, to_email=tenant.email, subject=subject, body=body
+                )
+                tenant.last_error_alert_at = now
+                # Committed per tenant, immediately after the email goes out.
+                # Deferring to one commit at the end meant a later tenant's
+                # database error rolled back the throttle stamps of everyone
+                # already emailed — so the next hourly run emailed them all
+                # again, and again, for as long as the error persisted.
+                await db.commit()
+            except Exception as e:
+                # One tenant's failure must not silence the alert for every
+                # tenant after it in the loop — those are the ones whose
+                # inboxes may actually be broken.
+                await db.rollback()
+                log.error("error_rate_check_failed", tenant_id=str(tenant.id), error=str(e))
+                sentry_sdk.capture_exception(e)
+
+
+async def _tenant_health_alert(db, tenant, now, day_ago):
+    """(subject, body) for one tenant's health alert, or (None, None).
+
+    Both queries here are on RLS-protected tables, so they run inside this
+    tenant's context; unscoped they would return nothing and every tenant
+    would look perfectly healthy with zero of everything.
+    """
+    from sqlalchemy import func, select
+
+    from app.core.policy import poll_is_stale
+    from app.database import apply_tenant_context, tenant_scope
+    from app.models.email_thread import EmailThread
+    from app.models.integration import Integration
+
+    with tenant_scope(tenant.id):
+        await apply_tenant_context(db)
+
+        # ── Mode 2: is the mailbox connection itself broken? ──────────────
+        integrations = (
+            (
+                await db.execute(
+                    select(Integration).where(
+                        Integration.tenant_id == tenant.id,
+                        Integration.is_active == True,  # noqa: E712
                     )
                 )
-                .scalars()
-                .all()
             )
-            broken = [
-                i
-                for i in integrations
-                if i.last_poll_error or poll_is_stale(i.last_poll_at, now)
-            ]
-            if broken:
-                mailbox = broken[0].gmail_address or "your mailbox"
-                log.warning(
-                    "tenant_integration_unhealthy",
-                    tenant_id=str(tenant.id),
-                    gmail=mailbox,
-                    error=broken[0].last_poll_error,
-                )
-                subject = "AccountFlow: action needed — we can't read your inbox"
-                body = (
-                    f"Hi {tenant.name},\n\n"
-                    f"AccountFlow has stopped being able to check {mailbox}.\n\n"
-                    f"New customer emails are NOT being answered right now. Your "
-                    f"mail itself is untouched and nothing has been lost — but "
-                    f"please treat that inbox manually until this is fixed.\n\n"
-                    f"This usually means the Google connection expired or was "
-                    f"revoked. Reconnecting it from your settings normally "
-                    f"resolves it. We've been alerted too.\n\n"
-                    f"— AccountFlow"
-                )
+            .scalars()
+            .all()
+        )
+        broken = [
+            i for i in integrations if i.last_poll_error or poll_is_stale(i.last_poll_at, now)
+        ]
 
-            # ── Mode 1: mail arrives, but processing keeps failing ────────
-            if subject is None:
-                counts = await db.execute(
-                    select(
-                        func.count(EmailThread.id).filter(EmailThread.status == "failed"),
-                        func.count(EmailThread.id),
-                    ).where(
-                        EmailThread.tenant_id == tenant.id,
-                        EmailThread.created_at >= day_ago,
-                    )
-                )
-                failed, total = counts.one()
-                if total and failed >= 3 and (failed / total) >= 0.10:
-                    log.warning(
-                        "tenant_error_rate_alert",
-                        tenant_id=str(tenant.id),
-                        failed=failed,
-                        total=total,
-                    )
-                    subject = "AccountFlow: some of your emails need attention"
-                    body = (
-                        f"Hi {tenant.name},\n\n"
-                        f"In the last 24 hours, {failed} of {total} incoming emails "
-                        f"could not be processed automatically.\n\n"
-                        f"They are safe — nothing was lost — but the AI could not "
-                        f"handle them, so please review your inbox for anything "
-                        f"urgent. Our team has been notified and is investigating.\n\n"
-                        f"— AccountFlow"
-                    )
-
-            if subject is None:
-                continue
-
-            await asyncio.to_thread(
-                send_email, to_email=tenant.email, subject=subject, body=body
+        # ── Mode 1: mail arrives, but processing keeps failing ────────────
+        counts = await db.execute(
+            select(
+                func.count(EmailThread.id).filter(EmailThread.status == "failed"),
+                func.count(EmailThread.id),
+            ).where(
+                EmailThread.tenant_id == tenant.id,
+                EmailThread.created_at >= day_ago,
             )
-            tenant.last_error_alert_at = now
+        )
+        failed, total = counts.one()
 
-        await db.commit()
+    if broken:
+        mailbox = broken[0].mailbox_address or "your mailbox"
+        log.warning(
+            "tenant_integration_unhealthy",
+            tenant_id=str(tenant.id),
+            error=broken[0].last_poll_error,
+        )
+        return (
+            "AccountFlow: action needed — we can't read your inbox",
+            f"Hi {tenant.name},\n\n"
+            f"AccountFlow has stopped being able to check {mailbox}.\n\n"
+            f"New customer emails are NOT being answered right now. Your "
+            f"mail itself is untouched and nothing has been lost — but "
+            f"please treat that inbox manually until this is fixed.\n\n"
+            f"This usually means the mailbox connection expired or was "
+            f"revoked. Reconnecting it from your settings normally "
+            f"resolves it. We've been alerted too.\n\n"
+            f"— AccountFlow",
+        )
+
+    if total and failed >= 3 and (failed / total) >= 0.10:
+        log.warning(
+            "tenant_error_rate_alert", tenant_id=str(tenant.id), failed=failed, total=total
+        )
+        return (
+            "AccountFlow: some of your emails need attention",
+            f"Hi {tenant.name},\n\n"
+            f"In the last 24 hours, {failed} of {total} incoming emails "
+            f"could not be processed automatically.\n\n"
+            f"They are safe — nothing was lost — but the AI could not "
+            f"handle them, so please review your inbox for anything "
+            f"urgent. Our team has been notified and is investigating.\n\n"
+            f"— AccountFlow",
+        )
+
+    return None, None

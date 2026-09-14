@@ -11,6 +11,41 @@ jobs:
     defaults:
       run:
         working-directory: accountflow
+    services:
+      # Real Postgres: row-level security and the worker path cannot be tested
+      # without one (tests/test_rls.py, tests/test_worker_e2e.py).
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: accountflow
+          POSTGRES_USER: accountflow
+          POSTGRES_PASSWORD: accountflow
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U accountflow"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      # Owner DSN for Alembic; runtime DSN for the app and the tests. The two
+      # roles MUST differ — migration 010 refuses to run otherwise, because the
+      # table owner bypasses RLS. Throwaway credentials for the CI service only.
+      MIGRATION_DATABASE_URL: postgresql+asyncpg://accountflow:accountflow@localhost:5432/accountflow
+      DATABASE_URL: postgresql+asyncpg://accountflow_app:accountflow_app@localhost:5432/accountflow
+      # Turn "no database, skip" into a failure: CI must never go green by not
+      # running the isolation tests.
+      REQUIRE_POSTGRES: "1"
+      REDIS_URL: redis://localhost:6379/0
+      DASHBOARD_API_KEY: test-dashboard-key
+      JWT_SECRET_KEY: test-jwt-secret
+      ANTHROPIC_API_KEY: test
+      GOOGLE_CLIENT_ID: test
+      GOOGLE_CLIENT_SECRET: test
+      GOOGLE_REDIRECT_URI: https://example.com/api/auth/google/callback
+      SENDGRID_API_KEY: test
+      SENDGRID_FROM_EMAIL: test@example.com
+      ENVIRONMENT: test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,6 +55,14 @@ jobs:
           cache-dependency-path: accountflow/requirements.txt
       - run: pip install -r requirements.txt
       - run: python -m compileall -q app alembic
+      - name: Throwaway Fernet key for this run
+        run: |
+          echo "FERNET_KEY=$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')" >> "$GITHUB_ENV"
+      - name: Migrate as the owner, and prove every downgrade() runs
+        run: |
+          alembic upgrade head
+          alembic downgrade 008
+          alembic upgrade head
       - run: pytest -q
 
   compose:

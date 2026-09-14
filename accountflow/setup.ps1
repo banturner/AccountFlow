@@ -28,7 +28,7 @@ if ($LASTEXITCODE -ne 0) {
 # -- 2. First run: create .env with fresh secrets ------------------------
 if (-not (Test-Path ".env")) {
   Say "Creating your settings file (.env) with fresh secure secrets"
-  $pg = New-HexSecret; $redis = New-HexSecret
+  $pg = New-HexSecret; $app = New-HexSecret; $redis = New-HexSecret
   $fernet = New-B64UrlSecret; $admin = New-HexSecret
   $jwt = (New-HexSecret) + (New-HexSecret)
   $env_content = @"
@@ -36,7 +36,9 @@ if (-not (Test-Path ".env")) {
 POSTGRES_DB=accountflow
 POSTGRES_USER=accountflow
 POSTGRES_PASSWORD=$pg
-DATABASE_URL=postgresql+asyncpg://accountflow:$pg@db:5432/accountflow
+# The app connects as accountflow_app (row-level security); Alembic as the owner.
+DATABASE_URL=postgresql+asyncpg://accountflow_app:$app@db:5432/accountflow
+MIGRATION_DATABASE_URL=postgresql+asyncpg://accountflow:$pg@db:5432/accountflow
 
 # -- Redis (auto-generated, do not change) -----------------
 REDIS_PASSWORD=$redis

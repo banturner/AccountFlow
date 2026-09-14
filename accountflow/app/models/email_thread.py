@@ -22,6 +22,11 @@ class EmailThread(Base):
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
+    # The mailbox this message arrived through (migration 009, ADR-002). A
+    # reply is sent from THIS integration, never from "any active one".
+    integration_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("integrations.id"), nullable=False, index=True
+    )
     # Gmail thread ID — unique per tenant
     gmail_thread_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     gmail_message_id: Mapped[str] = mapped_column(String(255), nullable=False)

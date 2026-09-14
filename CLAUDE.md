@@ -3,18 +3,19 @@
 AI email-automation SaaS for Singapore SMB clinics: reads a customer's mailbox (Gmail or Microsoft 365), classifies each email with Claude, and drafts replies / books appointments / creates tasks for the owner to approve. Inbound email may contain health data — treat every change as touching regulated personal data.
 
 ## Repo layout
-- `accountflow/` — the service. FastAPI 0.111 + SQLAlchemy 2.0 async (asyncpg) · Alembic `001`–`008` · Celery 5.4 + Redis · PostgreSQL 16 · Python 3.12.
+- `accountflow/` — the service. FastAPI 0.111 + SQLAlchemy 2.0 async (asyncpg) · Alembic `001`–`010` · Celery 5.4 + Redis · PostgreSQL 16 · Python 3.12.
   - `app/api/routes/` tenant API (JWT) and admin tenant CRUD (`X-API-Key`) · `app/api/deps.py` (`get_current_tenant`, `require_admin_key`)
   - `app/worker/tasks.py` poll → classify → act · `app/worker/celery_app.py` Beat schedule
   - `app/services/` `mail_provider.py` fronting `gmail.py` / `outlook.py`; `claude.py`; `calendar.py`; `sendgrid.py`; `draft_actions.py`
   - `app/core/` `tokens.py` (stdlib HS256 JWT — python-jose was deliberately rejected), `security.py` (Fernet), `policy.py`, `logging.py` (structlog)
+  - `app/database.py` engine, sessions, and the tenant context (`bind_tenant` / `tenant_scope` / `apply_tenant_context`) that drives row-level security
   - `tests/` pytest; `conftest.py` seeds the env
 - `docs/` — canonical markdown: master prompt, roadmaps, review report, PDPA pack, `STATUS.md` (what has actually shipped), `adr/` (architecture decisions)
 - `business/` — decks, spreadsheets, exports. Not in git.
 - `.claude/agents/` — `architect` (read-only, returns ADRs), `integrations` (OAuth / providers, works in its own git worktree), `ai-pipeline` (Claude layer), `reviewer` (read-only second pass)
 
 ## Invariants — every change is checked against these
-1. **Tenant isolation.** `tenant_id` comes only from the verified JWT (`get_current_tenant`) or the worker's per-tenant loop — never from query, body, path, header, or provider payload. Every query on `integrations`, `email_threads`, `drafts`, `tasks` filters by it. `tests/test_route_security.py` enforces this at the route level.
+1. **Tenant isolation.** `tenant_id` comes only from the verified JWT (`get_current_tenant`) or the worker's per-tenant loop — never from query, body, path, header, or provider payload. Every query on `integrations`, `email_threads`, `drafts`, `tasks` filters by it. `tests/test_route_security.py` enforces this at the route level. Postgres row-level security backstops it (`docs/adr/001-row-level-security.md`): those four tables are `FORCE ROW LEVEL SECURITY`, the app connects as the non-owner `accountflow_app` role, and every request or task binds its tenant before its first query — `bind_tenant` in the API (JWT, review token, OAuth state), `tenant_scope` around each worker task, `apply_tenant_context` inside cross-tenant loops. No context means zero rows. A cross-tenant sweep reads `tenants` (not under RLS) first, then works per tenant with the context set and flushes before moving on. `tests/test_rls.py` and `tests/test_worker_e2e.py` prove this against Postgres in CI.
 2. **Secrets.** OAuth tokens only in `integrations.*_enc`, Fernet-encrypted. Never in logs, exceptions, Sentry, fixtures. `app/config.py` refuses to start in production with placeholder secrets.
 3. **Inbound email is hostile.** CR/LF stripped before any header; outgoing Gmail built with `EmailMessage`; Graph builds its own headers; everything rendered is HTML-escaped; review links are GET-renders / POST-acts; email content enters the Claude prompt as delimited data in the user turn.
 4. **Nothing sends without a human unless the tenant opted in.** Auto-send is per-tenant, default off.
@@ -26,7 +27,7 @@ AI email-automation SaaS for Singapore SMB clinics: reads a customer's mailbox (
 ```bash
 # dev — docker-compose.override.yml is auto-loaded and adds the live-reload bind mount
 cd accountflow && docker compose up --build
-docker compose exec api alembic upgrade head
+docker compose exec api alembic upgrade head   # uses MIGRATION_DATABASE_URL (owner); the app uses DATABASE_URL (accountflow_app)
 
 # tests — needs Python 3.12 + requirements; CI runs them on every push
 cd accountflow && pytest
@@ -48,7 +49,7 @@ Deploy runbook: `accountflow/DEPLOY_KVM2.md`. Onboarding: `accountflow/ONBOARDIN
 
 ## Working rules
 - Read the file you are changing in full first. `docs/AccountFlow_Review_Report.md` records four P0 crashes that came from partial reads of `worker/tasks.py`.
-- Migrations: next is `009_`; every `upgrade()` has a working `downgrade()`; model and migration stay in parity.
-- Tests accompany any change to auth, OAuth, token storage, sync, the worker, or the Claude prompt — then run the `reviewer` agent on the diff before merging.
+- Migrations: next is `011_`; every `upgrade()` has a working `downgrade()`; model and migration stay in parity. CI runs `upgrade head → downgrade 008 → upgrade head` against a real Postgres. A new table that holds customer data gets `tenant_id`, an index on it, and its own RLS policy in the same migration.
+- Tests accompany any change to auth, OAuth, token storage, sync, the worker, or the Claude prompt — then run the `reviewer` agent on the diff before merging. The Postgres-backed tests (`tests/test_rls.py`, `tests/test_worker_e2e.py`) skip locally when `DATABASE_URL` is unreachable and are mandatory in CI (`REQUIRE_POSTGRES=1`).
 - Out of scope in Year 1: on-prem, voice, fine-tuning, a proprietary LLM, a free tier.
 - Never claim "PDPA-certified" or "data never leaves Singapore" — see `docs/PDPA_Baseline_Pack.md`.

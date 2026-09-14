@@ -27,8 +27,12 @@ def _looks_like_placeholder(value: str) -> bool:
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    # Database
+    # Database. Runtime connects as the non-owner `accountflow_app` role so
+    # row-level security applies (ADR-001); Alembic needs the table owner and
+    # takes migration_database_url, falling back to database_url only for a
+    # database that predates the role split.
     database_url: str
+    migration_database_url: str = ""
 
     # Redis
     redis_url: str
@@ -98,6 +102,7 @@ class Settings(BaseSettings):
 
         candidates = {
             "DATABASE_URL": self.database_url,
+            "MIGRATION_DATABASE_URL": self.migration_database_url,
             "REDIS_URL": self.redis_url,
             "FERNET_KEY": self.fernet_key,
             "DASHBOARD_API_KEY": self.dashboard_api_key,

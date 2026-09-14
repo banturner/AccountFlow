@@ -27,8 +27,10 @@ class Integration(Base):
     )
     # e.g. "google"
     provider: Mapped[str] = mapped_column(String(50), nullable=False)
-    # Gmail address this token belongs to
-    gmail_address: Mapped[str] = mapped_column(String(255), nullable=True)
+    # Address of the connected mailbox — Gmail or Microsoft 365. Written from
+    # the provider's identity claims at connect time; read for the self-send
+    # filter and as the From header on Gmail sends.
+    mailbox_address: Mapped[str] = mapped_column(String(255), nullable=True)
 
     # Fernet-encrypted token JSON
     access_token_enc: Mapped[str] = mapped_column(Text, nullable=False)
@@ -67,4 +69,4 @@ class Integration(Base):
     tenant: Mapped["Tenant"] = relationship(back_populates="integrations")  # noqa: F821
 
     def __repr__(self) -> str:
-        return f"<Integration tenant={self.tenant_id} provider={self.provider} gmail={self.gmail_address}>"
+        return f"<Integration tenant={self.tenant_id} provider={self.provider} mailbox={self.mailbox_address}>"

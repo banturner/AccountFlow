@@ -20,6 +20,11 @@ class Draft(Base):
     thread_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("email_threads.id", ondelete="CASCADE"), nullable=False
     )
+    # The mailbox the reply goes out from — the thread's integration, fixed at
+    # draft time (migration 009, ADR-002) so approval cannot pick another one.
+    integration_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("integrations.id"), nullable=False, index=True
+    )
 
     to_email: Mapped[str] = mapped_column(String(255), nullable=False)
     subject: Mapped[str] = mapped_column(String(1000), nullable=True)
@@ -36,8 +41,9 @@ class Draft(Base):
     # Rejection reason (Phase 3 — feeds monthly AI tuning review)
     rejection_reason: Mapped[str] = mapped_column(Text, nullable=True)
 
-    # SendGrid message ID — set after successful send
-    sendgrid_message_id: Mapped[str] = mapped_column(String(255), nullable=True)
+    # Provider id (Gmail message id / Graph message id) of the sent reply — set
+    # after a successful send. Misnamed sendgrid_message_id until migration 009.
+    sent_message_id: Mapped[str] = mapped_column(String(255), nullable=True)
 
     ai_confidence: Mapped[float] = mapped_column(nullable=True)
 
