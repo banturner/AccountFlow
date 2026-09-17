@@ -55,8 +55,14 @@ function Invoke-TokenRequest([hashtable]$Body) {
         if (-not $detail) {
             $response = $_.Exception.Response
             if ($null -eq $response -or -not $response.PSObject.Methods['GetResponseStream']) { throw }
-            $detail = (New-Object System.IO.StreamReader($response.GetResponseStream())).ReadToEnd()
+            # The stream has already been read to the end by the time the error
+            # reaches us, so without the rewind ReadToEnd() returns "" and the
+            # AADSTS code is lost.
+            $stream = $response.GetResponseStream()
+            if ($stream.CanSeek) { $stream.Position = 0 }
+            $detail = (New-Object System.IO.StreamReader($stream)).ReadToEnd()
         }
+        if (-not $detail) { $detail = $_.Exception.Message }
         Write-Host ""
         Write-Host "Microsoft rejected the request:" -ForegroundColor Red
         Write-Host $detail
