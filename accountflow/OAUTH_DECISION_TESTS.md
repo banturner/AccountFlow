@@ -107,28 +107,56 @@ without any audit, and does the connection survive a week?
    `{client_id}`):
 
    ```
-   https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id={client_id}&response_type=code&redirect_uri=http://localhost:8000/api/auth/microsoft/callback&response_mode=query&scope=offline_access%20https://graph.microsoft.com/Mail.Read%20https://graph.microsoft.com/Mail.Send%20https://graph.microsoft.com/Calendars.ReadWrite
+   https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id={client_id}&response_type=code&redirect_uri=http://localhost:8000/api/auth/microsoft/callback&response_mode=query&scope=offline_access%20https://graph.microsoft.com/Mail.Read%20https://graph.microsoft.com/Mail.Send%20https://graph.microsoft.com/Calendars.ReadWrite%20https://graph.microsoft.com/User.Read
    ```
 
    Sign in as the mailbox owner and consent. You will be redirected to
-   `localhost` with `?code=...` in the URL — the page failing to load is
-   fine, the code in the address bar is what matters.
-7. Exchange the code for tokens (any HTTP client):
+   `localhost` with `?code=...` in the URL.
+
+   **"This site can't be reached" / `ERR_CONNECTION_REFUSED` is the pass
+   condition, not a failure.** Nothing is listening on port 8000 because
+   AccountFlow is not running for this test. The browser is showing you an
+   error; Microsoft already said yes. Click into the address bar, `Ctrl+A`,
+   `Ctrl+C`, and keep the whole URL — it is truncated on screen, so do not
+   transcribe it by eye. The code is everything between `code=` and the next
+   `&`; drop `&session_state=...` and any trailing `#`.
+
+   Codes expire in about ten minutes and are single use. Go straight to
+   step 7. If it lapses, just re-open this URL — consent is already granted,
+   so it round-trips instantly.
+7. Exchange the code for tokens, and 8. confirm you can read mail.
+
+   **On Windows, run the script — it does both steps and the day 8 re-check:**
+
+   ```powershell
+   cd accountflow\scripts
+   .\oauth_test_microsoft.ps1
+   ```
+
+   It prompts for the client ID, the secret (hidden), and the callback URL;
+   pulls the code out of the URL for you; prints Microsoft's actual `AADSTS`
+   error instead of a bare `400`; and saves the refresh token for day 8.
+
+   `grant_type` and `redirect_uri` are literals from the OAuth spec, not
+   values to look up in the portal. The secret is the **Value** column, never
+   the **Secret ID** — the Secret ID is a GUID, the Value is not. A GUID in
+   that field is `AADSTS7000215` every time.
+
+   **The raw calls**, for a non-Windows box or to see what the script sends:
 
    ```bash
    curl -X POST https://login.microsoftonline.com/common/oauth2/v2.0/token \
      -d client_id=CLIENT_ID -d client_secret=CLIENT_SECRET \
      -d grant_type=authorization_code -d code=THE_CODE \
      -d redirect_uri=http://localhost:8000/api/auth/microsoft/callback
-   ```
 
-   Save the `refresh_token` from the response.
-8. Confirm you can actually read mail:
-
-   ```bash
    curl -H "Authorization: Bearer ACCESS_TOKEN" \
      "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?\$top=3&\$select=subject,from,receivedDateTime"
    ```
+
+   Save the `refresh_token` from the first response. Do not paste it, or the
+   client secret, into a chat, an issue, or a shared doc — rotate the secret
+   in Entra if you do.
 
 ### What to record
 
@@ -140,9 +168,10 @@ without any audit, and does the connection survive a week?
 - [ ] Did the Graph call return real messages?
 - [ ] **Day 8:** does the saved `refresh_token` still mint a new access token?
 
-Re-run step 7 on day 8 with `grant_type=refresh_token` and
-`refresh_token=THE_SAVED_TOKEN`. Microsoft has no 7-day guillotine, so this
-should simply work — but the point of the test is to prove it, not trust it.
+On day 8 run `.\oauth_test_microsoft.ps1 -Refresh`, or re-run step 7 by hand
+with `grant_type=refresh_token` and `refresh_token=THE_SAVED_TOKEN`. Microsoft
+has no 7-day guillotine, so this should simply work — but the point of the test
+is to prove it, not trust it.
 
 ### Verdict
 

@@ -90,7 +90,7 @@ Status words: DONE · PARTIAL · OPEN · VERIFY (believed true, not confirmed in
 | 6 | Worker end-to-end test with Postgres in CI | OPEN | Prerequisite for 7 |
 | 7 | Row-level security per `adr/001-row-level-security.md` | OPEN — session started 2026-09-13 | Blocked on 4 and 6 |
 | 8 | Prod memory caps trimmed (api 384m, worker 512m), DB pool 5/5; then deploy: domain, TLS, backup cron | OPEN | `docker-compose.prod.yml`, `database.py`, `DEPLOY_KVM2.md` |
-| 9 | `OAUTH_DECISION_TESTS.md` A and B against the deployed instance | OPEN | Decides customer #1's provider |
+| 9 | `OAUTH_DECISION_TESTS.md` A and B against the deployed instance | OPEN — Test B in progress 2026-09-17: Entra app registered, admin consent granted, no audit or certification demanded; steps 7–8 not yet passed | Decides customer #1's provider. Runner for Test B steps 7–8 and the day 8 re-check: `accountflow/scripts/oauth_test_microsoft.ps1` |
 | 10 | PDPA pack §2 amended for the SendGrid review notification; DPO named; Anthropic + SendGrid DPAs | OPEN — founder | `docs/PDPA_Baseline_Pack.md` |
 
 ## Test coverage
