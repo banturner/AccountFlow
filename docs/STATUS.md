@@ -60,7 +60,7 @@ Status words: DONE · PARTIAL · OPEN · VERIFY (believed true, not confirmed in
 
 | Item | Status | Evidence |
 |---|---|---|
-| Microsoft 365 / Graph provider | PARTIAL — written Aug 2026, **not yet run against a live tenant** | `services/outlook.py` header; decision procedure in `accountflow/OAUTH_DECISION_TESTS.md`; unit tests added 2026-09-12 |
+| Microsoft 365 / Graph provider | PARTIAL — written Aug 2026; the **OAuth path is now proven against a live tenant** (2026-09-17), the provider code itself still is not | `services/outlook.py` header; decision procedure in `accountflow/OAUTH_DECISION_TESTS.md`; unit tests added 2026-09-12. Test B confirmed admin consent, the code-for-token exchange and a Graph inbox read by hand; `services/outlook.py` has not yet polled a real mailbox |
 | Emailed draft-review links (GET renders, POST acts) | DONE | `api/routes/review.py`, `core/security.py` |
 | Token usage per email | DONE | `email_threads.ai_input_tokens` / `ai_output_tokens` |
 | Message-level dedup + reply threading | DONE | `worker/tasks.py`, `services/gmail.py`, migration `006` |
@@ -90,7 +90,7 @@ Status words: DONE · PARTIAL · OPEN · VERIFY (believed true, not confirmed in
 | 6 | Worker end-to-end test with Postgres in CI | OPEN | Prerequisite for 7 |
 | 7 | Row-level security per `adr/001-row-level-security.md` | OPEN — session started 2026-09-13 | Blocked on 4 and 6 |
 | 8 | Prod memory caps trimmed (api 384m, worker 512m), DB pool 5/5; then deploy: domain, TLS, backup cron | OPEN | `docker-compose.prod.yml`, `database.py`, `DEPLOY_KVM2.md` |
-| 9 | `OAUTH_DECISION_TESTS.md` A and B against the deployed instance | OPEN — Test B in progress 2026-09-17: Entra app registered, admin consent granted, no audit or certification demanded; steps 7–8 not yet passed | Decides customer #1's provider. Runner for Test B steps 7–8 and the day 8 re-check: `accountflow/scripts/oauth_test_microsoft.ps1` |
+| 9 | `OAUTH_DECISION_TESTS.md` A and B against the deployed instance | OPEN — **Test B steps 1–8 PASSED 2026-09-17**; day 8 refresh check due 2026-09-25. Test A not started | Decides customer #1's provider. Admin consent was one click, nothing demanded certification or an audit, and Graph returned real inbox messages. Runner: `accountflow/scripts/oauth_test_microsoft.ps1` (`-Refresh` for day 8) |
 | 10 | PDPA pack §2 amended for the SendGrid review notification; DPO named; Anthropic + SendGrid DPAs | OPEN — founder | `docs/PDPA_Baseline_Pack.md` |
 
 ## Test coverage

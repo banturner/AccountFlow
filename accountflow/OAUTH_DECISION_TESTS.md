@@ -173,6 +173,22 @@ with `grant_type=refresh_token` and `refresh_token=THE_SAVED_TOKEN`. Microsoft
 has no 7-day guillotine, so this should simply work — but the point of the test
 is to prove it, not trust it.
 
+### Result — run 2026-09-17
+
+Steps 1–8 passed on a Microsoft 365 trial tenant.
+
+- Admin consent was a single click. Nothing anywhere in the flow mentioned
+  certification, attestation or an audit.
+- The code-for-token exchange returned an access token and a refresh token.
+- Graph returned real inbox messages on `/me/mailFolders/inbox/messages`.
+
+**Day 8 re-check is due 2026-09-25** and is the only box still open. Run
+`scripts/oauth_test_microsoft.ps1 -Refresh`.
+
+Housekeeping when the test is finished: rotate the client secret in Entra and
+delete the saved refresh-token file. Both are live credentials for an app that
+can read a mailbox.
+
 ### Verdict
 
 | Outcome | What it means |
