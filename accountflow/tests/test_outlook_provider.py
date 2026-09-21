@@ -391,23 +391,51 @@ async def test_page_with_no_links_is_recorded_as_a_stalled_cursor(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_max_results_is_enforced_within_a_page(monkeypatch):
-    """The page-level check alone let one poll hold 20 full pages in memory.
-    The worker has 512m on a box it shares with the kitchen bots."""
+async def test_a_page_is_consumed_whole_even_past_max_results(monkeypatch):
+    """The cursor can only point BETWEEN pages. Stopping at max_results partway
+    through a page and then advancing to that page's nextLink would skip the
+    rest of it permanently — the same mail loss the nextLink fix was for.
+    max_results bounds pages, $top bounds page size."""
+    next_link = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$skiptoken=p2"
+    calls = {"n": 0}
+
     def handler(request):
+        calls["n"] += 1
         return httpx.Response(
             200,
             json={
-                "value": [_graph_message(id=f"AAMk-{n}") for n in range(50)],
-                "@odata.nextLink": "https://graph.microsoft.com/v1.0/x/delta?$skiptoken=p2",
+                "value": [_graph_message(id=f"AAMk-{calls['n']}-{n}") for n in range(50)],
+                "@odata.nextLink": next_link,
             },
         )
 
     _install_graph(monkeypatch, handler)
+    integration = _integration(DELTA)
 
-    messages = await outlook.fetch_new_messages(_FakeDb(), _integration(DELTA), max_results=5)
+    messages = await outlook.fetch_new_messages(_FakeDb(), integration, max_results=5)
 
-    assert len(messages) == 5
+    # One page, all of it, then stop. Not five of fifty.
+    assert len(messages) == 50
+    assert calls["n"] == 1
+    assert integration.sync_state == next_link
+
+
+@pytest.mark.asyncio
+async def test_parked_cursor_carries_top_to_bound_page_size(monkeypatch):
+    """With pages consumed whole, $top is the only thing keeping one poll from
+    holding thousands of messages in a worker capped at 512m."""
+    seen = {}
+
+    def handler(request):
+        if "/delta" in request.url.path:
+            seen["top"] = request.url.params.get("$top")
+            return httpx.Response(200, json={"@odata.deltaLink": PARKED})
+        return httpx.Response(200, json={"value": []})
+
+    _install_graph(monkeypatch, handler)
+    await outlook.fetch_new_messages(_FakeDb(), _integration(None), max_results=25)
+
+    assert seen["top"] == "25"
 
 
 # ── first poll: parking failures are visible ────────────────────────────────

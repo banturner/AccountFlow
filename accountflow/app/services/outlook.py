@@ -293,11 +293,13 @@ async def fetch_new_messages(
                     resp.raise_for_status()
                     payload = resp.json()
 
+                    # A page is consumed WHOLE, even past max_results. The
+                    # cursor can only point between pages, so stopping mid-page
+                    # and then advancing to this page's nextLink would skip the
+                    # rest of it permanently. Page size is bounded by $top on
+                    # the parking request instead; max_results is honoured
+                    # between pages, one page of slack.
                     for msg in payload.get("value", []):
-                        if len(messages) >= max_results:
-                            # Checked per message, not just per page: a worker
-                            # capped at 512m cannot hold 20 unbounded pages.
-                            break
                         # Deletions arrive here too, as an id and a marker.
                         if msg.get("@removed") or not msg.get("id"):
                             continue
@@ -334,7 +336,14 @@ async def fetch_new_messages(
                     # Graph bakes the query options into the token, so $select
                     # has to be set HERE to apply to every later delta page.
                     # Without it each page drags back full message resources.
-                    params={"$deltatoken": "latest", "$select": select_fields},
+                    # $top bounds the size of every later delta page, which is
+                    # the only lever on worker memory now that pages are always
+                    # consumed whole.
+                    params={
+                        "$deltatoken": "latest",
+                        "$select": select_fields,
+                        "$top": max_results,
+                    },
                 )
                 latest.raise_for_status()
                 parked = latest.json().get("@odata.deltaLink")
