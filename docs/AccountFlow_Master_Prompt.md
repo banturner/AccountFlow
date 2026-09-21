@@ -1,6 +1,6 @@
 # AccountFlow / AccountFlow.ai — Master Project Prompt
 
-> **Verified against code on 2026-09-12.** The code is the source of truth; `STATUS.md` in this folder records what has actually shipped. If that date is older than the change you are making, check the code before trusting a statement here. Claude Code sessions use the repo-root `CLAUDE.md` instead of this file; this prompt is for Claude.ai Projects and general co-founder conversations.
+> **Verified against code on 2026-09-21.** The code is the source of truth; `STATUS.md` in this folder records what has actually shipped. If that date is older than the change you are making, check the code before trusting a statement here. Claude Code sessions use the repo-root `CLAUDE.md` instead of this file; this prompt is for Claude.ai Projects and general co-founder conversations.
 
 > **How to use this prompt:**
 > Paste the contents below (starting from "---") as a system prompt in Claude's Project Instructions, or paste it at the start of any new conversation to instantly brief Claude as a fully informed co-founder assistant.
@@ -50,7 +50,7 @@ When the founder asks a question, you answer it relative to *this specific busin
 **Core value proposition:** Automate 80% of inbound customer emails — drafting replies, booking calendar appointments, creating follow-up tasks — with no IT setup required. Targeted at price-sensitive Singapore small businesses (dental clinics, med-aesthetic clinics, legal firms, F&B) that receive repetitive customer emails but can't afford a full-time admin.
 
 **The AI workflow:**
-1. The connected mailbox — Gmail via the Gmail API, or Microsoft 365 via Microsoft Graph (`app/services/outlook.py`, written Aug 2026, not yet run against a live tenant) — is polled every 120 seconds
+1. The connected mailbox — Gmail via the Gmail API, or Microsoft 365 via Microsoft Graph (`app/services/outlook.py`, written Aug 2026) — is polled every 120 seconds. The Microsoft OAuth path was proven against a live M365 tenant on 2026-09-17 (`accountflow/OAUTH_DECISION_TESTS.md` Test B); `outlook.py` itself has still never polled a real mailbox, and a review on 2026-09-21 found three bugs in it that a live poll would have caught on day one
 2. Each email is classified and processed by Claude Haiku (with Sonnet escalation for low-confidence cases)
 3. The AI decides: draft a reply, create a calendar appointment, create a task, or flag for human review
 4. If the tenant has opted in to auto-send and confidence clears their threshold, the draft is sent automatically; otherwise it is queued for owner approval (the default for every new tenant)
@@ -228,7 +228,7 @@ When helping with **strategy and fundraising tasks**, you:
 ## WHAT IS EXPLICITLY OUT OF SCOPE (YEAR 1)
 
 Do not suggest or build:
-- ~~Microsoft 365 / Outlook support~~ — shipped Aug 2026 (`app/services/outlook.py`). See `accountflow/OAUTH_DECISION_TESTS.md`: Microsoft may become the *primary* provider, because reading Gmail is a restricted scope that requires an annual CASA audit and Graph does not
+- ~~Microsoft 365 / Outlook support~~ — shipped Aug 2026 (`app/services/outlook.py`), and as of Test B (2026-09-17) Microsoft is the **presumed primary provider for pilot #1**, not a follow-on. The old reasoning here was "add after Gmail is proven", which was written before anyone costed the Google side: reading Gmail is a *restricted* scope gated behind an annual third-party CASA audit, while Graph needed one admin click and mentioned no audit at all. Treat Gmail as the second provider until a prospect forces otherwise. Test A (Google Workspace Internal) is deliberately not run — its only job was to decide Google vs Microsoft, and Test B decided it
 - On-premise deployment
 - Voice / phone call handling
 - Fine-tuning the LLM (revisit at 10K+ emails processed)
@@ -237,4 +237,4 @@ Do not suggest or build:
 
 ---
 
-*Context last updated: 12 September 2026. Stack: FastAPI · PostgreSQL 16 · Celery · Claude Haiku 4.5 → Sonnet 4.6 · Gmail API + Microsoft Graph · Docker Compose → Kubernetes · Hostinger VPS → DigitalOcean*
+*Context last updated: 21 September 2026. Stack: FastAPI · PostgreSQL 16 · Celery · Claude Haiku 4.5 → Sonnet 4.6 · Gmail API + Microsoft Graph · Docker Compose → Kubernetes · Hostinger VPS → DigitalOcean*

@@ -182,12 +182,55 @@ Steps 1–8 passed on a Microsoft 365 trial tenant.
 - The code-for-token exchange returned an access token and a refresh token.
 - Graph returned real inbox messages on `/me/mailFolders/inbox/messages`.
 
-**Day 8 re-check is due 2026-09-25** and is the only box still open. Run
-`scripts/oauth_test_microsoft.ps1 -Refresh`.
+**Day 8 re-check is due 2026-09-25** and is the only box in Test B still open.
+Run `scripts/oauth_test_microsoft.ps1 -Refresh`.
+
+The "unverified publisher" box was never ticked either way on 2026-09-17. It is
+cosmetic and free to fix, but a clinic admin will ask about it, so record it on
+the day 8 run: re-open the consent URL from step 6 and read the screen before
+consenting.
 
 Housekeeping when the test is finished: rotate the client secret in Entra and
 delete the saved refresh-token file. Both are live credentials for an app that
-can read a mailbox.
+can read a mailbox. Refresh tokens survive a secret rotation, but redeeming one
+needs a valid secret, so rotate and keep the new Value before day 8, not after.
+
+### Step 9 — poll the mailbox through AccountFlow's own code
+
+Steps 1–8 prove Microsoft's side. They do not touch `app/services/outlook.py`,
+which has still never polled a real mailbox — a separate and larger risk, since
+that file was written from the Graph reference alone.
+
+While the day 8 access token is fresh, run:
+
+```bash
+cd accountflow
+python scripts/graph_live_smoke.py
+```
+
+It redeems the stored refresh token through the same MSAL call the worker
+makes, then drives `outlook.fetch_new_messages` twice: once as a newly
+connected mailbox, once following the delta cursor it just parked. It is read
+only — no sending, no calendar writes, no database. Bodies are hidden unless
+you pass `--show-bodies`.
+
+What it proves: the refresh path, the backlog query, delta parking, cursor
+advance, and that every field the pipeline reads comes back populated. What it
+still does not prove: `send_reply`, `create_appointment`, `check_availability`,
+and the row lock in `get_access_token`, which needs a real database.
+
+Three bugs found by code review on 2026-09-21 would each have failed this step,
+so run it against a build that includes them fixed:
+
+- the first poll sent `$filter=isRead eq false` with
+  `$orderby=receivedDateTime desc`, which Graph rejects with 400
+  `ErrorInefficientFilter` — every first poll of every mailbox;
+- a delta round longer than `max_results` dropped the `@odata.nextLink` and
+  kept the old cursor, so the same page was re-read forever and mail behind it
+  was never seen;
+- Graph delta republishes a message on *any* change, `isRead` included, so a
+  clinic clearing its unread backlog would have had replies drafted to a month
+  of already-handled mail.
 
 ### Verdict
 

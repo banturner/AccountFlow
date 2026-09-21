@@ -3,10 +3,11 @@
 Mirrors app/services/gmail.py function-for-function so app/services/
 mail_provider.py can dispatch between them without the pipeline noticing.
 
-⚠️  NOT YET RUN AGAINST A LIVE TENANT. Written from the Graph reference; every
-    call is marked with its endpoint so it can be checked against
-    https://learn.microsoft.com/en-us/graph/api/overview. Work through
-    OAUTH_DECISION_TESTS.md Test B before trusting any of it.
+⚠️  THIS MODULE HAS STILL NEVER POLLED A LIVE MAILBOX. OAUTH_DECISION_TESTS.md
+    Test B proved the OAuth path by hand on 2026-09-17 (admin consent, code
+    exchange, a Graph inbox read), but that was PowerShell, not this file.
+    Poll, refresh and the delta cursor remain unproven end to end — run
+    scripts/graph_live_smoke.py against a real tenant before trusting them.
 
 Why Graph rather than Gmail, in short: reading mail on Google is a RESTRICTED
 scope requiring an annual third-party CASA audit, while the equivalent Graph
@@ -27,6 +28,11 @@ Three places Graph genuinely differs from Gmail, all handled below:
    attendee on an event the moment it is created, so suppressing notification
    means creating the event WITHOUT attendees and naming the customer in the
    body instead.
+
+4. Delta reports every CHANGE, not every arrival. Gmail's history feed can be
+   narrowed to `historyTypes=["messageAdded"]`; Graph has no equivalent, so
+   marking an old email read republishes it as if it were new. `_horizon`
+   below is the compensating filter.
 """
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -59,6 +65,17 @@ SCOPES = [
 ]
 
 _TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+
+# How far back the FIRST poll of a freshly connected mailbox looks. Gmail's
+# first poll takes the unread INBOX backlog capped at max_results; Graph needs
+# an explicit date bound because $orderby is only legal alongside a $filter
+# that leads with the sorted property (see fetch_new_messages).
+FIRST_POLL_LOOKBACK = timedelta(days=30)
+
+# Guard on the delta pager. A round whose pages are mostly updates to old mail
+# yields few usable messages, so the max_results guard alone would let one poll
+# walk an unbounded number of pages.
+_MAX_DELTA_PAGES = 20
 
 
 def _msal_app():
@@ -191,15 +208,41 @@ def parse_message(msg: dict) -> dict:
     }
 
 
+def _horizon(integration: Integration) -> Optional[datetime]:
+    """Oldest mail this integration is allowed to act on.
+
+    Graph's delta feed reports *every* change to a message, not just its
+    arrival: marking an email read, flagging it, moving it or re-categorising
+    it all come back as a full message resource, indistinguishable from new
+    mail. Gmail has no equivalent problem because its history feed is filtered
+    to `historyTypes=["messageAdded"]`.
+
+    Without a floor, a clinic that clears a month of unread mail the day after
+    connecting would have AccountFlow draft replies to all of it. The mailbox
+    was not ours to act on before it was connected, so `created_at` is the
+    floor; anything newer that we have genuinely already handled is caught by
+    the message-level dedup in `worker/tasks.py`.
+    """
+    created = getattr(integration, "created_at", None)
+    if not created:
+        return None
+    return created.replace(tzinfo=timezone.utc) if created.tzinfo is None else created
+
+
 async def fetch_new_messages(
     db: AsyncSession, integration: Integration, max_results: int = 50
 ) -> list[dict]:
     """Fetch mail that arrived since the last poll, using a delta link.
 
-    First poll: read recent inbox messages, then ask Graph for a delta link
-    positioned at "now" ($deltatoken=latest) so the next poll returns only new
-    mail. That mirrors the Gmail path's first-poll getProfile/historyId trick
-    and avoids enumerating an entire mailbox on connect.
+    First poll: park a delta link at "now" ($deltatoken=latest), then read the
+    recent unread backlog. Parking the cursor FIRST means mail landing during
+    the read is delivered twice rather than never — the pipeline dedups by
+    message id, so a duplicate is free and a miss is not.
+
+    Subsequent polls follow the stored link. Whatever link Graph last handed
+    back is persisted, `@odata.nextLink` included, so a round that runs past
+    `max_results` resumes mid-round next time instead of restarting and
+    stalling the cursor forever.
     """
     access_token = await get_access_token(db, integration)
     if not access_token:
@@ -211,13 +254,19 @@ async def fetch_new_messages(
         "id,conversationId,internetMessageId,subject,from,receivedDateTime,body,bodyPreview"
     )
     messages: list[dict] = []
+    horizon = _horizon(integration)
 
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             if integration.sync_state:
                 url = integration.sync_state
-                # Page through until Graph hands back a fresh deltaLink.
-                while url and len(messages) < max_results:
+                # Always advance the cursor to the last link Graph gave us,
+                # even when we stop early. Keeping the old link would re-read
+                # the same page every poll and never reach later mail.
+                cursor = url
+                pages = 0
+                while url and len(messages) < max_results and pages < _MAX_DELTA_PAGES:
+                    pages += 1
                     resp = await client.get(url, headers=_headers(access_token, plain_text=True))
                     if resp.status_code == 410:
                         # Delta token expired — reset and resync next cycle.
@@ -232,16 +281,44 @@ async def fetch_new_messages(
                     payload = resp.json()
 
                     for msg in payload.get("value", []):
-                        # Deletions and read-state changes also arrive here.
+                        # Deletions arrive here too, as an id and a marker.
                         if msg.get("@removed") or not msg.get("id"):
                             continue
-                        messages.append(parse_message(msg))
+                        parsed = parse_message(msg)
+                        if horizon and parsed["received_at"] < horizon:
+                            # An update to mail that predates the connection,
+                            # not an arrival. See _horizon.
+                            continue
+                        messages.append(parsed)
 
-                    if payload.get("@odata.deltaLink"):
-                        integration.sync_state = payload["@odata.deltaLink"]
+                    delta_link = payload.get("@odata.deltaLink")
+                    next_link = payload.get("@odata.nextLink")
+                    cursor = delta_link or next_link or cursor
+                    if delta_link:
                         break
-                    url = payload.get("@odata.nextLink")
+                    url = next_link
+
+                integration.sync_state = cursor
             else:
+                # Park the cursor before reading, so nothing that arrives
+                # mid-read falls into the gap between the two calls.
+                latest = await client.get(
+                    f"{GRAPH}/me/mailFolders/inbox/messages/delta",
+                    headers=_headers(access_token),
+                    params={"$deltatoken": "latest"},
+                )
+                latest.raise_for_status()
+                parked = latest.json().get("@odata.deltaLink")
+                if not parked:
+                    # Without a cursor every poll repeats this branch and
+                    # re-reads the whole backlog forever. Dedup keeps that out
+                    # of the pipeline, so it is quiet — hence the explicit log.
+                    log.error(
+                        "microsoft_delta_park_failed",
+                        integration_id=str(integration.id),
+                    )
+
+                since = datetime.now(timezone.utc) - FIRST_POLL_LOOKBACK
                 resp = await client.get(
                     f"{GRAPH}/me/mailFolders/inbox/messages",
                     headers=_headers(access_token, plain_text=True),
@@ -249,21 +326,25 @@ async def fetch_new_messages(
                         "$select": select_fields,
                         "$top": max_results,
                         "$orderby": "receivedDateTime desc",
-                        "$filter": "isRead eq false",
+                        # Graph rejects $filter + $orderby unless every sorted
+                        # property appears in the filter FIRST — otherwise it
+                        # is a 400 ErrorInefficientFilter, "the restriction or
+                        # sort order is too complex". `isRead eq false` with
+                        # `$orderby=receivedDateTime desc` alone therefore
+                        # failed on every first poll.
+                        "$filter": (
+                            f"receivedDateTime ge {since.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+                            " and isRead eq false"
+                        ),
                     },
                 )
                 resp.raise_for_status()
                 for msg in resp.json().get("value", []):
                     messages.append(parse_message(msg))
 
-                # Park a delta link at "now" for subsequent polls.
-                latest = await client.get(
-                    f"{GRAPH}/me/mailFolders/inbox/messages/delta",
-                    headers=_headers(access_token),
-                    params={"$deltatoken": "latest"},
-                )
-                latest.raise_for_status()
-                integration.sync_state = latest.json().get("@odata.deltaLink")
+                # Only now — a failed backlog read must not leave the cursor
+                # parked past mail we never handed to the pipeline.
+                integration.sync_state = parked
 
             integration.last_poll_error = None
             await db.flush()

@@ -1,6 +1,6 @@
 # AccountFlow — Roadmap status
 
-**Verified against code on 2026-09-13.** This table is the only place that says what has *shipped*; the roadmap documents describe intent. Update the relevant row in the same commit as the change.
+**Verified against code on 2026-09-21.** This table is the only place that says what has *shipped*; the roadmap documents describe intent. Update the relevant row in the same commit as the change.
 
 Whole-system architecture review: `architecture_review_2026-09-13.md` — verdict, ranked findings, tenant-isolation walk, and the recommended order of work before customer #1. Its RLS design is `adr/001-row-level-security.md` (proposed).
 
@@ -60,7 +60,7 @@ Status words: DONE · PARTIAL · OPEN · VERIFY (believed true, not confirmed in
 
 | Item | Status | Evidence |
 |---|---|---|
-| Microsoft 365 / Graph provider | PARTIAL — written Aug 2026; the **OAuth path is now proven against a live tenant** (2026-09-17), the provider code itself still is not | `services/outlook.py` header; decision procedure in `accountflow/OAUTH_DECISION_TESTS.md`; unit tests added 2026-09-12. Test B confirmed admin consent, the code-for-token exchange and a Graph inbox read by hand; `services/outlook.py` has not yet polled a real mailbox |
+| Microsoft 365 / Graph provider | PARTIAL — written Aug 2026; the **OAuth path is proven against a live tenant** (2026-09-17), the provider code itself still is not | `services/outlook.py` header; decision procedure in `accountflow/OAUTH_DECISION_TESTS.md`; unit tests added 2026-09-12, extended 2026-09-21. Test B confirmed admin consent, the code-for-token exchange and a Graph inbox read by hand; `services/outlook.py` has still not polled a real mailbox. Three first-poll/delta bugs fixed 2026-09-21 (see below); `scripts/graph_live_smoke.py` runs the real provider against a live tenant as Test B step 9 |
 | Emailed draft-review links (GET renders, POST acts) | DONE | `api/routes/review.py`, `core/security.py` |
 | Token usage per email | DONE | `email_threads.ai_input_tokens` / `ai_output_tokens` |
 | Message-level dedup + reply threading | DONE | `worker/tasks.py`, `services/gmail.py`, migration `006` |
@@ -90,12 +90,13 @@ Status words: DONE · PARTIAL · OPEN · VERIFY (believed true, not confirmed in
 | 6 | Worker end-to-end test with Postgres in CI | OPEN | Prerequisite for 7 |
 | 7 | Row-level security per `adr/001-row-level-security.md` | OPEN — session started 2026-09-13 | Blocked on 4 and 6 |
 | 8 | Prod memory caps trimmed (api 384m, worker 512m), DB pool 5/5; then deploy: domain, TLS, backup cron | OPEN | `docker-compose.prod.yml`, `database.py`, `DEPLOY_KVM2.md` |
-| 9 | `OAUTH_DECISION_TESTS.md` A and B against the deployed instance | OPEN — **Test B steps 1–8 PASSED 2026-09-17**; day 8 refresh check due 2026-09-25. Test A not started | Decides customer #1's provider. Admin consent was one click, nothing demanded certification or an audit, and Graph returned real inbox messages. Runner: `accountflow/scripts/oauth_test_microsoft.ps1` (`-Refresh` for day 8) |
+| 9 | `OAUTH_DECISION_TESTS.md` A and B against the deployed instance | OPEN — **Test B steps 1–8 PASSED 2026-09-17**; day 8 refresh check due 2026-09-25, then new step 9 (poll through `services/outlook.py`). Test A not started, deliberately: its only job was Google vs Microsoft and Test B answered that | Decides customer #1's provider. Admin consent was one click, nothing demanded certification or an audit, and Graph returned real inbox messages. Runners: `accountflow/scripts/oauth_test_microsoft.ps1` (`-Refresh` for day 8), `accountflow/scripts/graph_live_smoke.py` (step 9) |
 | 10 | PDPA pack §2 amended for the SendGrid review notification; DPO named; Anthropic + SendGrid DPAs | OPEN — founder | `docs/PDPA_Baseline_Pack.md` |
+| 11 | Graph provider first-poll and delta-cursor bugs — `$filter`/`$orderby` 400 `ErrorInefficientFilter` on every first poll; dropped `@odata.nextLink` stalling the cursor on any round past `max_results`; delta `isRead` updates replaying pre-connection mail into the pipeline | DONE 2026-09-21 | `services/outlook.py` `fetch_new_messages` / `_horizon`; 7 new tests in `tests/test_outlook_provider.py`. Found by review, **not yet confirmed against a live tenant** — that is Test B step 9 |
 
 ## Test coverage
 
-Present: JWT sign/verify/tamper, bcrypt policy, Fernet state and review tokens, policy rules, Gmail MIME parsing, Graph parsing + delta sync (410 reset, deltaLink persistence, error recording), route auth audit, config guard.
+Present: JWT sign/verify/tamper, bcrypt policy, Fernet state and review tokens, policy rules, Gmail MIME parsing, Graph parsing + first poll (filter/orderby shape, cursor parked before the backlog read, no cursor on a failed read) + delta sync (410 reset, deltaLink and nextLink persistence, page cap, pre-connection mail ignored, error recording), route auth audit, config guard.
 
 Gaps, in order of risk: the worker path end to end (needs a Postgres service in CI plus `alembic upgrade head`); Gmail `send_reply` header sanitisation against a live-shaped payload; `services/calendar.py`; `services/claude.py` prompt fixtures (benign / injection / low-confidence / over-cap).
 
