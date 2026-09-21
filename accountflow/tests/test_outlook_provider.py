@@ -327,3 +327,126 @@ async def test_naive_created_at_is_treated_as_utc(monkeypatch):
 
     assert [m["message_id"] for m in messages] == ["AAMk-1"]
 
+
+# ── delta: the cursor can always be recovered ───────────────────────────────
+
+@pytest.mark.asyncio
+async def test_stale_skiptoken_400_resets_the_cursor_like_a_410(monkeypatch):
+    """410 is the documented delta expiry, but a stale $skiptoken comes back
+    400. Left to raise_for_status() that URL would be re-issued every poll
+    forever with nothing able to clear it — worse than the stall it replaced."""
+    def handler(request):
+        return httpx.Response(400, json={"error": {"code": "ErrorInvalidSkipToken"}})
+
+    _install_graph(monkeypatch, handler)
+    integration = _integration(DELTA)
+
+    messages = await outlook.fetch_new_messages(_FakeDb(), integration)
+
+    assert messages == []
+    assert integration.sync_state is None
+    assert integration.last_poll_error is None
+
+
+@pytest.mark.asyncio
+async def test_rejected_cursor_mid_round_keeps_the_pages_already_read(monkeypatch):
+    """Dropping them loses any the resync cannot reach: the first-poll branch
+    only sees unread mail inside FIRST_POLL_LOOKBACK, so anything a
+    receptionist has already opened would be gone silently."""
+    next_link = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$skiptoken=page2"
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(
+                200,
+                json={"value": [_graph_message()], "@odata.nextLink": next_link},
+            )
+        return httpx.Response(410, json={"error": {"code": "SyncStateNotFound"}})
+
+    _install_graph(monkeypatch, handler)
+    integration = _integration(DELTA)
+
+    messages = await outlook.fetch_new_messages(_FakeDb(), integration, max_results=50)
+
+    assert [m["message_id"] for m in messages] == ["AAMk-1"]
+    assert integration.sync_state is None
+
+
+@pytest.mark.asyncio
+async def test_page_with_no_links_is_recorded_as_a_stalled_cursor(monkeypatch):
+    """Keeping the old cursor and clearing the error is the exact silent stall
+    this branch was rewritten to remove."""
+    def handler(request):
+        return httpx.Response(200, json={"value": []})
+
+    _install_graph(monkeypatch, handler)
+    integration = _integration(DELTA)
+
+    await outlook.fetch_new_messages(_FakeDb(), integration)
+
+    assert integration.sync_state == DELTA
+    assert "did not advance" in integration.last_poll_error
+
+
+@pytest.mark.asyncio
+async def test_max_results_is_enforced_within_a_page(monkeypatch):
+    """The page-level check alone let one poll hold 20 full pages in memory.
+    The worker has 512m on a box it shares with the kitchen bots."""
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "value": [_graph_message(id=f"AAMk-{n}") for n in range(50)],
+                "@odata.nextLink": "https://graph.microsoft.com/v1.0/x/delta?$skiptoken=p2",
+            },
+        )
+
+    _install_graph(monkeypatch, handler)
+
+    messages = await outlook.fetch_new_messages(_FakeDb(), _integration(DELTA), max_results=5)
+
+    assert len(messages) == 5
+
+
+# ── first poll: parking failures are visible ────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_missing_delta_link_is_recorded_not_swallowed(monkeypatch):
+    """Without a cursor the mailbox re-reads its backlog every 120s forever.
+    Dedup hides it from the pipeline, so it looks perfectly healthy while new
+    mail a staff member opens before the poll is never seen."""
+    def handler(request):
+        if "/delta" in request.url.path:
+            return httpx.Response(200, json={})
+        return httpx.Response(200, json={"value": []})
+
+    _install_graph(monkeypatch, handler)
+    integration = _integration(None)
+
+    await outlook.fetch_new_messages(_FakeDb(), integration)
+
+    assert integration.sync_state is None
+    assert "not syncing incrementally" in integration.last_poll_error
+
+
+@pytest.mark.asyncio
+async def test_parked_cursor_carries_select_so_delta_pages_are_not_full_resources(monkeypatch):
+    """Graph bakes query options into the token, so $select has to be set on
+    the parking request or every later delta page drags back everything."""
+    seen = {}
+
+    def handler(request):
+        if "/delta" in request.url.path:
+            seen["select"] = request.url.params.get("$select")
+            return httpx.Response(200, json={"@odata.deltaLink": PARKED})
+        return httpx.Response(200, json={"value": []})
+
+    _install_graph(monkeypatch, handler)
+    await outlook.fetch_new_messages(_FakeDb(), _integration(None))
+
+    assert seen["select"] is not None
+    assert "body" in seen["select"]
+    assert "conversationId" in seen["select"]
+

@@ -255,6 +255,9 @@ async def fetch_new_messages(
     )
     messages: list[dict] = []
     horizon = _horizon(integration)
+    # Degraded-but-not-failed outcomes set this instead of clearing the error,
+    # so the hourly health check can see a mailbox that is quietly not syncing.
+    poll_error: Optional[str] = None
 
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
@@ -265,22 +268,36 @@ async def fetch_new_messages(
                 # the same page every poll and never reach later mail.
                 cursor = url
                 pages = 0
+                saw_link = False
                 while url and len(messages) < max_results and pages < _MAX_DELTA_PAGES:
                     pages += 1
                     resp = await client.get(url, headers=_headers(access_token, plain_text=True))
-                    if resp.status_code == 410:
-                        # Delta token expired — reset and resync next cycle.
+                    if resp.status_code in (400, 410):
+                        # The stored cursor is no good. 410 is the documented
+                        # expiry, but a stale $skiptoken comes back 400 — and a
+                        # 400 left to raise_for_status() would re-issue the same
+                        # dead URL every poll forever, which no reset can clear.
+                        # We built neither URL, so either status means resync.
                         log.warning(
-                            "microsoft_delta_expired", integration_id=str(integration.id)
+                            "microsoft_delta_cursor_rejected",
+                            status=resp.status_code,
+                            integration_id=str(integration.id),
                         )
                         integration.sync_state = None
                         integration.last_poll_error = None
                         await db.flush()
-                        return []
+                        # Pages already parsed are still valid mail. Dropping
+                        # them would lose any that the resync cannot reach —
+                        # it only sees unread mail inside FIRST_POLL_LOOKBACK.
+                        return messages
                     resp.raise_for_status()
                     payload = resp.json()
 
                     for msg in payload.get("value", []):
+                        if len(messages) >= max_results:
+                            # Checked per message, not just per page: a worker
+                            # capped at 512m cannot hold 20 unbounded pages.
+                            break
                         # Deletions arrive here too, as an id and a marker.
                         if msg.get("@removed") or not msg.get("id"):
                             continue
@@ -293,26 +310,40 @@ async def fetch_new_messages(
 
                     delta_link = payload.get("@odata.deltaLink")
                     next_link = payload.get("@odata.nextLink")
+                    saw_link = saw_link or bool(delta_link or next_link)
                     cursor = delta_link or next_link or cursor
                     if delta_link:
                         break
                     url = next_link
 
                 integration.sync_state = cursor
+                if not saw_link:
+                    # Neither link means the cursor did not move. Silently
+                    # re-reading the same page every 120s is the exact stall
+                    # this branch was rewritten to remove, so say so.
+                    poll_error = "Graph returned no delta or next link; sync cursor did not advance."
+                    log.error(
+                        "microsoft_delta_no_link", integration_id=str(integration.id)
+                    )
             else:
                 # Park the cursor before reading, so nothing that arrives
                 # mid-read falls into the gap between the two calls.
                 latest = await client.get(
                     f"{GRAPH}/me/mailFolders/inbox/messages/delta",
                     headers=_headers(access_token),
-                    params={"$deltatoken": "latest"},
+                    # Graph bakes the query options into the token, so $select
+                    # has to be set HERE to apply to every later delta page.
+                    # Without it each page drags back full message resources.
+                    params={"$deltatoken": "latest", "$select": select_fields},
                 )
                 latest.raise_for_status()
                 parked = latest.json().get("@odata.deltaLink")
                 if not parked:
                     # Without a cursor every poll repeats this branch and
                     # re-reads the whole backlog forever. Dedup keeps that out
-                    # of the pipeline, so it is quiet — hence the explicit log.
+                    # of the pipeline, so nothing looks wrong while new mail
+                    # a staff member opens before the poll is missed entirely.
+                    poll_error = "Graph did not return a delta link; this mailbox is not syncing incrementally."
                     log.error(
                         "microsoft_delta_park_failed",
                         integration_id=str(integration.id),
@@ -346,7 +377,7 @@ async def fetch_new_messages(
                 # parked past mail we never handed to the pipeline.
                 integration.sync_state = parked
 
-            integration.last_poll_error = None
+            integration.last_poll_error = poll_error
             await db.flush()
 
     except httpx.HTTPStatusError as e:

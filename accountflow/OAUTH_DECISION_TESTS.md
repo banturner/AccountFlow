@@ -214,10 +214,17 @@ connected mailbox, once following the delta cursor it just parked. It is read
 only — no sending, no calendar writes, no database. Bodies are hidden unless
 you pass `--show-bodies`.
 
-What it proves: the refresh path, the backlog query, delta parking, cursor
+What it proves: the MSAL refresh call, the backlog query, delta parking, cursor
 advance, and that every field the pipeline reads comes back populated. What it
 still does not prove: `send_reply`, `create_appointment`, `check_availability`,
-and the row lock in `get_access_token`, which needs a real database.
+and `get_access_token` itself — the script does the refresh by hand and stubs
+that function out, because its `SELECT ... FOR UPDATE` row lock needs a real
+database. Its expiry check, rotation-persist and no-refresh-token branches have
+no coverage at all, on either provider.
+
+A quiet mailbox returning nothing is the likeliest outcome and proves nothing,
+so the script reports NOT PROVEN rather than PASS. Send the mailbox some mail
+and **leave it unread** before running.
 
 Three bugs found by code review on 2026-09-21 would each have failed this step,
 so run it against a build that includes them fixed:
